@@ -1,0 +1,2032 @@
+__X-CGD project code__ - Sukalp Muzumdar, CSHL (2022)
+
+Project background - 
+
+Data sources - 10X single-cell sequencing of PBMCs and isolated monocytes from peripheral blood of probands and carriers with X-linked chronic granulomatous disease (X-CGD), as well as age- and sex-matched controls (14 male probands, 10 female carriers, and 15 (8 male, and 7 female) controls).
+
+Outline of analysis
+
+1. Load all required data into environment
+2. Initial quality control - filter out poor quality cells
+3. Integrate all samples across batch using Seurat RPCA pipeline
+4. Clustering of integrated output, followed by cluster annotation
+5. Differential abundance analysis
+6. Differential expression analysis - probands vs controls using DESeq2
+7. Geneset enrichment analysis of differentially expressed genes in X-CGD probands vs controls
+8. Definition of cluster-specific signatures in X-CGD probands
+9. Evaluate expression of cluster-specific signatures in X-CGD carriers (incl. correlation with DHR/NOI scores)
+10. Evaluate whether expression of cluster-specific signatures can classify carriers from controls (+ calculate null expectation/p-value)
+11. Load in reference CoCoCoNet co-expression networks for human and other species (+ subset and re-rank networks)
+12. Evaluate co-expression of cluster-specific disease signatures in reference co-expression networks
+13. Evaluate conservation of co-expression using 1-1 orthologs across species in reference co-expression networks
+14. Evaluate co-expression partners of CYBB with relationship to the type 1 interferon pathway
+
+***
+
+Checking if all required CRAN and Bioconductor packages are installed and 
+installing (as needed) and loading them into the environment
+```{r, message = FALSE}
+package_list <- c("BiocManager", "data.table", "ggplot2", "tidyverse", "Seurat", "dplyr", 
+                 "cowplot", "Matrix.utils", "magrittr", "Matrix",
+                 "reshape2", "tibble", "RColorBrewer", "ggrepel", 
+                 "scales", "future", "parallel", "ComplexHeatmap", 
+                 "colorspace", "circlize", "rstatix", "devtools",
+                 "ggpubr", "rcartocolor", "stringi", "igraph")
+
+verify_packages <- lapply(package_list, FUN = function(pkg) {
+  if (!require(pkg, character.only = TRUE)){
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+    }
+  else{library(pkg, character.only = TRUE)}
+  }
+)
+
+bioc_packages <- c("ComplexHeatmap", "EGAD", "DESeq2", "SingleCellExperiment", 
+                   "S4Vectors", "fgsea", "rhdf5", "ggpubr")
+
+verify_packages <- lapply(bioc_packages, FUN = function(pkg) {
+    if (!require(pkg, character.only = TRUE)) {
+      BiocManager::install(pkg, dependencies = TRUE)
+      library(pkg, character.only = TRUE)
+    }
+  else{library(pkg, character.only = TRUE)}
+  }
+)
+
+```
+
+Install custom utility function package hosted on Github which has custom-written
+utility functions for enrichment, matrix calculations etc.
+```{r}
+devtools::install_github("sukalpm/utility.functions/utility.functions")
+library(utility.functions)
+```
+        
+Set global variables/options and links to external files
+```{r}
+source("src/globals.R", local = knitr::knit_global())
+```
+
+```{r}
+root.dir_10x_data <- "all_aligned_samples/organized"
+mito.genes.file <- "supp_files/hgnc_mito.txt"
+cell.cycle.genes.file <- "supp_files/cycle.rda"
+GO_complete <- fgsea::gmtPathways("suppl_files/c5.go.v7.2.symbols.gmt")
+```
+
+Define cell order for all future plots
+```{r}
+cell_order <- c("B cells", "CD14+ Monocytes", "CD16+ Monocytes", "CD8+ T-cells", "Effector CD4+ T-cells", "MAIT", "Naïve CD4+ T-cells", "NK cells", "(iso) CD14+ Monocytes", 
+                "(iso) CD16+ Monocytes")
+```
+
+__1. Load all required data into environment__
+
+Initial loading of data into R environment
+Read in 10X sequencing data
+```{r}
+sample.list <- list.dirs(root.dir_10x_data, recursive = FALSE, full.names = FALSE)
+
+min.cells = 3
+min.features = 200
+
+cell.types <- c("/mono", "/pbmc")
+
+data.sources.table <- data.table(data.source = c(), proj.name = c())
+
+for (sample in sample.list){
+  for (cell.type in cell.types){
+    cell.ranger.v2.folder = paste(root.dir_10x_data, "/", sample, cell.type, 
+                                  "/outs/filtered_gene_bc_matrices/GRCh38", sep = "")
+    cell.ranger.v3.folder = paste(root.dir_10x_data, "/", sample, cell.type, 
+                                  "/outs/filtered_feature_bc_matrix/", sep = "")
+    if (dir.exists(cell.ranger.v2.folder) == TRUE){
+      data.sources.table <- rbind(data.sources.table, 
+                                  data.table(data.source = cell.ranger.v2.folder, 
+                                             proj.name = paste(sample, cell.type, sep = "")))
+    }
+    else if (dir.exists(cell.ranger.v3.folder) == TRUE){
+      data.sources.table <- rbind(data.sources.table, 
+                                  data.table(data.source = cell.ranger.v3.folder, 
+                                             proj.name = paste(sample, cell.type, sep = "")))     
+    }
+  }
+}
+
+seuratObjs = list()
+seuratObjs = mapply(FUN = readCellRangerFolder, data.dir = data.sources.table$data.source,
+                    proj.name = data.sources.table$proj.name)
+```
+
+Merge Seurat objects to create initial datasets - 1 for PBMCs and 1 for monocytes
+```{r}
+all_monos <- seuratObjs[grepl("mono", names(seuratObjs))]
+all_pbmcs <- seuratObjs[grepl("pbmc", names(seuratObjs))]
+pbmc_names <- data.sources.table %>% filter(grepl("pbmc", proj.name))
+mono_names <- data.sources.table %>% filter(grepl("mono", proj.name))
+
+merged_pbmcs <- merge(x = all_pbmcs[[1]], y = tail(all_pbmcs, -1), 
+                add.cell.ids = pbmc_names$proj.name)
+
+merged_monos <- merge(x = all_monos[[1]], y = tail(all_monos, -1), 
+                add.cell.ids = mono_names$proj.name)
+
+#Ensure that the same genes are included in both the PBMC and isolated monocyte objects
+common.genes <- intersect(rownames(merged_pbmcs), rownames(merged_monos))
+merged_pbmcs <- subset(merged_pbmcs, features = common.genes)
+merged_monos <- subset(merged_monos, features = common.genes)
+
+#Remove unnecessary objects from the environment
+rm(all_monos)
+rm(all_pbmcs)
+rm(seuratObjs)
+gc()
+```
+
+Generate a mapping of ENSEMBL IDs to HGNC symbols including the chromosomes, so we can filter out sex chromosomes if needed for later analyses
+```{r}
+library(biomaRt)
+httr::set_config(httr::config(ssl_verifypeer = FALSE))
+mart <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", mirror = "uswest")
+mapping <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "chromosome_name"), 
+                                filters = c("ensembl_gene_id"), 
+                                values = rownames(merged_pbmcs@assays$RNA@counts), 
+                                mart = mart)
+filt_mapping <- mapping %>% filter(hgnc_symbol != "")
+```
+
+Average duplicate ENSEMBL IDs for PBMCs + only use genes which are mapped to HGNC ID
+```{r}
+merged_subset <- subset(x = merged_pbmcs, 
+                        features = filt_mapping$ensembl_gene_id)
+raw.data <- merged_subset@assays$RNA@counts
+rownames(raw.data) <- filt_mapping$hgnc_symbol[match(x = rownames(raw.data), table = filt_mapping$ensembl_gene_id)]
+duplicate.genes <- rownames(raw.data)[duplicated(rownames(raw.data))]
+
+tmp <- sapply(unique(duplicate.genes), function(x){
+  colMeans(raw.data[which(rownames(raw.data) == x),])
+})
+
+raw.data <- rbind(raw.data[-which(rownames(raw.data) %in% duplicate.genes), ], t(tmp))
+
+#Recreate Seurat object with values averaged across degenerate HGNC symbol mapping
+merged_subset <- CreateSeuratObject(counts = raw.data, project = "PBMCs", min.cells = min.cells, min.features = min.features)
+which(grepl(x = rownames(GetAssayData(merged_subset)), pattern = "\\."))
+```
+
+Average duplicate ENSEMBL IDs for Monos + only use genes which are mapped to HGNC ID
+```{r}
+merged_subset_monos <- subset(x = merged_monos, 
+                        features = filt_mapping$ensembl_gene_id)
+raw.data_monos <- merged_subset_monos@assays$RNA@counts
+rownames(raw.data_monos) <- filt_mapping$hgnc_symbol[match(x = rownames(raw.data_monos), table = filt_mapping$ensembl_gene_id)]
+duplicate.genes_monos <- rownames(raw.data_monos)[duplicated(rownames(raw.data_monos))]
+
+tmp_monos <- sapply(unique(duplicate.genes_monos), function(x){
+  colMeans(raw.data_monos[which(rownames(raw.data_monos) == x),])
+})
+
+raw.data_monos <- rbind(raw.data_monos[-which(rownames(raw.data_monos) %in% duplicate.genes_monos), ], t(tmp_monos))
+
+#Recreate Seurat object with values averaged across degenerate HGNC symbol mapping
+merged_subset_monos <- CreateSeuratObject(counts = raw.data_monos, project = "Monos", min.cells = min.cells, min.features = min.features)
+which(grepl(x = rownames(GetAssayData(merged_subset_monos)), pattern = "\\."))
+```
+
+Import list of mitochondrial genes (Obtained from Seurat vignette)
+```{r}
+mito.genes.hgnc <- read.csv(mito.genes.file, sep = "\t")
+mito.genes.hgnc <- mito.genes.hgnc$Approved.symbol
+```
+
+Calculate percentage of mitochondrial mapping reads
+```{r}
+merged_subset[['pMT_RNA']] <- PercentageFeatureSet(merged_subset, features = mito.genes.hgnc[mito.genes.hgnc %in% rownames(merged_subset)])
+
+merged_subset_monos[['pMT_RNA']] <- PercentageFeatureSet(merged_subset_monos, features = mito.genes.hgnc[mito.genes.hgnc %in% rownames(merged_subset_monos)])
+```
+
+Import sample metadata
+```{r}
+metadata_dir <- "/data/sukalp/X-CGD/xcgd_data/single_cell_data/curr_samples/"
+sample.metadata.pbmc <- readxl::read_xlsx(str_c(metadata_dir, "sample.metadata.xlsx"))
+sample.metadata.pbmc <- sample.metadata.pbmc %>% dplyr::rename(smpl = sample_name)
+
+sample.metadata.mono <- readxl::read_xlsx(str_c(metadata_dir, "sample.metadata.xlsx"))
+sample.metadata.mono <- sample.metadata.mono %>% dplyr::rename(smpl = sample_name)
+
+sample.metadata.pbmc <- sample.metadata.pbmc %>% 
+  mutate(Group = factor(Group, levels = SMPL_TYPES))
+
+sample.metadata.mono <- sample.metadata.mono %>% 
+  mutate(Group = factor(Group, levels = SMPL_TYPES))
+```
+
+Merge sample metadata into Seurat objects
+```{r}
+merged_subset@meta.data <- 
+  merge(sample.metadata.pbmc, 
+      merged_subset@meta.data %>% 
+      rownames_to_column("smpl_1") %>% 
+      mutate(smpl = str_split(smpl_1, "/", simplify = TRUE)[, 1]) %>% 
+      dplyr::rename(smpl_type = orig.ident, 
+                    nUMI = nCount_RNA, 
+                    nGene = nFeature_RNA), 
+  by = "smpl") %>% column_to_rownames("smpl_1")
+
+merged_subset_monos@meta.data <- 
+  merge(sample.metadata.mono, 
+      merged_subset_monos@meta.data %>% 
+      rownames_to_column("smpl_1") %>% 
+      mutate(smpl = str_split(smpl_1, "/", simplify = TRUE)[, 1]) %>% 
+      dplyr::rename(smpl_type = orig.ident, 
+                    nUMI = nCount_RNA, 
+                    nGene = nFeature_RNA), 
+  by = "smpl") %>% column_to_rownames("smpl_1")
+```
+
+Add smpl_type field to metadata - by assigning to either control, carrier, or proband samples
+```{r, fig.width = 12, fig.height = 12}
+merged_subset@meta.data <- merged_subset@meta.data %>%  
+  mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1])
+
+merged_subset_monos@meta.data <- merged_subset_monos@meta.data %>%  
+  mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1])
+```
+
+Plot DHR and NOI (dihydrorhodamine and neutrophil oxidative index measurements - complementary measures of the residual oxidative burst) across sample types (controls, carriers, and probands)
+
+__Fig. 1(B)__
+
+Boxplot of DHR measurements across sample types demonstrating a clear reduction in probands and large variablity in
+carriers of X-CGD
+
+```{r, fig.height=4, fig.width=2}
+sample.metadata.pbmc %>% 
+  ggplot() + aes(x = Group, y = DHR) + 
+  geom_boxplot(aes(fill = Group, alpha = .6), outlier.shape = NA) + 
+  geom_jitter(aes(col = Group, alpha = .6)) +
+  xlab("") + ylab("% DHR") +   
+  stat_compare_means(comparisons = 
+                       ALL_SMPL_TYPE_COMPARISONS, 
+                     method = "t.test", 
+                     label = "p.signif", 
+                     color = "grey40", vjust = 0.7, size = 5) + 
+  scale_fill_manual(values = DEFAULT_COLORS) + 
+  scale_color_manual(values = DEFAULT_COLORS)
+```
+
+__Fig. 1(B)__
+
+NOI measurements
+```{r, fig.height=4, fig.width=2}
+sample.metadata.pbmc %>% 
+  ggplot() + aes(x = Group, y = NOI) + 
+  geom_boxplot(aes(fill = Group, alpha = .6), outlier.shape = NA) + 
+  geom_jitter(aes(col = Group, alpha = .6)) +
+  xlab("") + ylab("NOI") +   
+  stat_compare_means(comparisons = 
+                       ALL_SMPL_TYPE_COMPARISONS, 
+                     method = "t.test", 
+                     label = "p.signif", 
+                     color = "grey40", vjust = 0.7, size = 5) + 
+  scale_fill_manual(values = DEFAULT_COLORS) + 
+  scale_color_manual(values = DEFAULT_COLORS)
+```
+
+Define sample order for plots etc.
+```{r}
+sample_order <- c("control_1", "control_f221", "control_f225", "control_f269", "control_fcon2", "control_fcon3", "control_fcon4", "control_m234", "control_m266", 
+                  "control_m270", "control_mcon1", "control_mcon2", "control_mcon3", "control_mcon4", "control_mcon6", "carrier_138", "carrier_148", 
+                  "carrier_150", "carrier_160", "carrier_161", "carrier_170", "carrier_178", "carrier_182", "carrier_268", "carrier_fsub1", "proband_139", 
+                  "proband_147", "proband_149", "proband_166", "proband_173", "proband_181", "proband_200", "proband_224", "proband_233", "proband_265", 
+                  "proband_267", "proband_271", "proband_272", "proband_msub1")
+```
+
+Set order of samples in merged object
+```{r}
+merged_subset$smpl <- factor(merged_subset$smpl, levels = sample_order)
+merged_subset_monos$smpl <- factor(merged_subset_monos$smpl, levels = sample_order)
+```
+
+Plot scatter plot depicting each cell measured - nUMIs vs nGenes detected, with the color depicting the percentage of mitochondrial reads mapped in the specific cell
+(first for PBMCs, and then for the isolated monocytes)
+
+__Suppl. Fig. 1(B)__
+
+Single-cell quality metrics for PBMCs
+```{r, fig.height=12, fig.width=14}
+merged_subset@meta.data %>% 
+  	ggplot(aes(x = nUMI, y = nGene, color = pMT_RNA)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "steelblue", high = "salmon", name = "% mito") +
+  	stat_smooth(method = loess) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	geom_vline(xintercept = MIN_UMI, linetype = "dashed", color = "springgreen4") +
+  	geom_hline(yintercept = MIN_GENES, linetype = "dashed", color = "springgreen4") +
+  	facet_wrap(~smpl) + xlab("# UMIs") + ylab("# Genes") + 
+   ggtitle("Genes by UMIs - PBMCs")
+```
+
+__Suppl. Fig. 1(C)__
+
+Single-cell quality metrics for isolated monocytes
+```{r, fig.height=12, fig.width=14}
+merged_subset_monos@meta.data %>% 
+  	ggplot(aes(x = nUMI, y = nGene, color = pMT_RNA)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "steelblue", high = "salmon", name = "% mito") +
+  	stat_smooth(method = loess) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	geom_vline(xintercept = MIN_UMI, linetype = "dashed", color = "springgreen4") +
+  	geom_hline(yintercept = MIN_GENES, linetype = "dashed", color = "springgreen4") +
+  	facet_wrap(~smpl) + 
+  xlab("# UMIs") + ylab("# Genes") + 
+   ggtitle("Genes by UMIs - Monocytes") + 
+```
+
+__2. Initial quality control - filter out poor quality cells__
+
+Filter out poorer quality cells from the object to be used for the final analysis - again, first for the PBMCs, and then for the isolated monocytes - parameters used are - 
+
+nUMI > 500
+nGene > 250
+log10GenesPerUMI > 0.8
+pMT_RNA < 20
+```{r}
+merged_subset@meta.data$log10GenesPerUMI <- log10(merged_subset@meta.data$nGene) / log10(merged_subset@meta.data$nUMI)
+
+filtered_subset <- subset(x = merged_subset, 
+                         subset= (nUMI >= MIN_UMI) & 
+                           (nGene >= MIN_GENES) & 
+                           (log10GenesPerUMI > MIN_LOG10_GENES_PER_UMI) & 
+                           (pMT_RNA < MAX_PCT_MT_RNA))
+```
+
+```{r}
+merged_subset_monos@meta.data$log10GenesPerUMI <- log10(merged_subset_monos@meta.data$nGene) / log10(merged_subset_monos@meta.data$nUMI)
+
+filtered_subset_monos <- subset(x = merged_subset_monos, 
+                         subset= (nUMI >= MIN_UMI) & 
+                           (nGene >= MIN_GENES) & 
+                           (log10GenesPerUMI > MIN_LOG10_GENES_PER_UMI) & 
+                           (pMT_RNA < MAX_PCT_MT_RNA))
+```
+
+Load in cell-cycle markers (from Seurat vignette)
+```{r}
+load(file = cell.cycle.genes.file)
+```
+
+Normalize/scale filtered data + perform PCA/UMAP (PBMCs)
+```{r}
+filtered_subset <- NormalizeData(filtered_subset)
+filtered_subset <- FindVariableFeatures(filtered_subset, selection.method = "vst", nfeatures = 2000)
+filtered_subset <- ScaleData(filtered_subset)
+plan("multiprocess", workers = 20)
+filtered_subset <- RunPCA(filtered_subset, seed.use = 42)
+filtered_subset <- RunUMAP(filtered_subset, dims = 1:10, reduction = "pca", seed.use = 42)
+plan("sequential")
+```
+
+Normalize/scale data + perform PCA/UMAP (isolated monocytes)
+```{r}
+filtered_subset_monos <- NormalizeData(filtered_subset_monos)
+filtered_subset_monos <- FindVariableFeatures(filtered_subset_monos, selection.method = "vst", nfeatures = 2000)
+filtered_subset_monos <- ScaleData(filtered_subset_monos)
+plan("multiprocess", workers = 20)
+filtered_subset_monos <- RunPCA(filtered_subset_monos, seed.use = 42)
+filtered_subset_monos <- RunUMAP(filtered_subset_monos, dims = 1:10, reduction = "pca", seed.use = 42)
+plan("sequential")
+```
+
+Verify if any batch effect is apparent based on  - 
+
+1. Source of the sample? (no)
+```{r}
+DimPlot(filtered_subset, reduction = "umap", group.by = "src")
+```
+
+```{r}
+DimPlot(filtered_subset_monos, reduction = "umap", group.by = "src")
+```
+
+2. Collection batch (pre-2020/post-mid-2021) (no)
+```{r}
+DimPlot(filtered_subset, reduction = "umap", group.by = "batch")
+```
+
+```{r}
+DimPlot(filtered_subset_monos, reduction = "umap", group.by = "batch")
+```
+
+Perform PCA on unintegrated data to look for any clear outlier samples/other potential sample-type-related clustering
+```{r}
+pre_excl_filtered_subset <- filtered_subset
+
+expr <- AggregateExpression(pre_excl_filtered_subset, assays = "RNA", slot = "counts", group.by = "smpl")
+
+vsd_total <- vst(round(expr$RNA, 0))
+
+set.seed(42)
+pcs <- prcomp(t(vsd_total))
+
+merge(data.frame(pcs$x) %>% rownames_to_column("smpl"), sample.metadata.pbmc, by = "smpl") %>% mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1]) %>%
+  ggplot() + aes(x = PC1, y = PC2, col = smpl_type, shape = batch) + 
+  geom_point(size = 3) + 
+  scale_color_manual(values = DEFAULT_COLORS, breaks = c("control", "carrier", "proband"), name = "Sample Type", 
+                     labels = SMPL_TYPES) +
+  scale_shape_manual(values = c(17, 19), breaks = c("new", "old"), labels = c("2021", "2019/2020"),
+                     name = "Batch") + theme_classic() + xlab("PC 1") + ylab("PC 2") + 
+  geom_label_repel(aes(label = smpl)) + 
+  ggtitle("PBMC samples") 
+```
+
+Control_m266 is a clear outlier sample in PCA space - exclude this sample from future analyses and re-normalize/scale + 
+re-perform PCA/UMAP after having excluded this sample
+```{r}
+filtered_subset <- subset(filtered_subset, smpl == "control_m266", invert = TRUE)
+filtered_subset <- NormalizeData(filtered_subset)
+filtered_subset <- FindVariableFeatures(filtered_subset, selection.method = "vst", nfeatures = 2000)
+filtered_subset <- ScaleData(filtered_subset)
+plan("multiprocess", workers = 20)
+filtered_subset <- RunPCA(filtered_subset, seed.use = 42)
+filtered_subset <- RunUMAP(filtered_subset, dims = 1:10, reduction = "pca", seed.use = 42)
+plan("sequential")
+```
+
+Pseduo-bulk aggregate expression matrices for PBMCs and isolated monocytes
+```{r}
+expr <- AggregateExpression(filtered_subset, assays = "RNA", slot = "counts", group.by = "smpl")
+expr_monos <- AggregateExpression(filtered_subset_monos, assays = "RNA", slot = "counts", group.by = "smpl")
+```
+
+__Suppl. Fig. 2(A)__
+Heatmap of sample correlation matrix (no clear clustering by sample type) (PBMCs)
+```{r, fig.height=8, fig.width=9}
+cor_cross_smpl <- cor(expr$RNA)
+
+col_fun = colorRamp2(c(0, 0.5, max(cor_cross_smpl)), c("#440154", "#21918c", "#fde725"))
+Heatmap(cor_cross_smpl, name = "Pearson r", col = col_fun) 
+```
+
+__Suppl. Fig. 2(B)__
+Heatmap of sample correlation matrix (no clear clustering by sample type) (isolated monocytes)
+```{r, fig.height=8, fig.width=9}
+cor_cross_smpl_mono <- cor(expr_monos$RNA)
+
+col_fun = colorRamp2(c(0, 0.5, max(cor_cross_smpl_mono)), c("#440154", "#21918c", "#fde725"))
+Heatmap(cor_cross_smpl_mono, name = "Pearson r", col = col_fun)
+```
+
+__Suppl. Fig. 2(C)__
+Distribution of sample correlation matrix correlation coefficients (PBMCs)
+```{r, fig.height=5, fig.width=7}
+melt(cor_cross_smpl) %>% 
+  ggplot() + 
+  aes(x = value) + 
+  xlim(0, 1) + 
+  geom_histogram(bins = 100, alpha = .8, fill = "steelblue", alpha = .8) + 
+  xlab("Pearson correlation coefficient") + 
+  ylab("Count") + 
+  theme_classic() + 
+  ggtitle("Distribution of correlations")
+```
+
+__Suppl. Fig. 2(D)__
+Distribution of sample correlation matrix correlation coefficients (isolated monocytes)
+```{r, fig.height=5, fig.width=7}
+melt(cor_cross_smpl_mono) %>% ggplot() + 
+  aes(x = value) + 
+  xlim(0, 1) + 
+  geom_histogram(bins = 100, alpha = .8, fill = "steelblue", alpha = .8) + 
+  xlab("Pearson correlation coefficient") + 
+  ylab("Count") + 
+  theme_classic() + 
+  ggtitle("Distribution of correlations")
+```
+
+__Suppl. Fig. 2(E)__
+Verify whether any separation by sample type (control, carrier, and proband) in evident in PCA space (PBMCs) - none evident
+```{r, fig.height=4, fig.width=6}
+vsd_total <- vst(round(expr$RNA, 0))
+
+set.seed(42)
+pcs <- prcomp(t(vsd_total))
+
+merge(data.frame(pcs$x) %>% rownames_to_column("smpl"), sample.metadata.pbmc, by = "smpl") %>% mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1]) %>%
+  ggplot() + aes(x = PC1, y = PC2, col = smpl_type) + 
+  geom_point(size = 3) + 
+  scale_color_manual(values = c("steelblue", "springgreen4", "salmon"), breaks = c("control", "carrier", "proband"), name = "Sample Type", 
+                     labels = SMPL_TYPES) +
+  theme_classic() + xlab("PC 1") + ylab("PC 2") + 
+  ggtitle("PBMC samples") + 
+  theme(legend.text = element_text(size = 10))
+```
+
+__Suppl. Fig. 2(F)__
+Verify whether any separation by sample type (control, carrier, and proband) in evident in PCA space (Monos) - no
+```{r, fig.height = 4, fig.width=6}
+vsd_total_monos <- vst(round(expr_monos$RNA, 0))
+
+set.seed(42)
+pcs_monos <- prcomp(t(vsd_total_monos))
+
+merge(data.frame(pcs_monos$x) %>% rownames_to_column("smpl"), sample.metadata.pbmc, by = "smpl") %>% mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1]) %>%
+  ggplot() + aes(x = PC1, y = PC2, col = smpl_type) + 
+  geom_point(size = 3) + 
+  scale_color_manual(values = c("steelblue", "springgreen4", "salmon"), 
+                     breaks = c("control", "carrier", "proband"), name = "Sample Type", 
+                     labels = SMPL_TYPES) +
+  theme_classic() + xlab("PC 1") + ylab("PC 2") + 
+  ggtitle("Monocyte samples") + 
+  theme(legend.text = element_text(size = 10))
+```
+
+__Suppl. Fig. 2(G)__
+PCA plot to look for separation by source of sample and year of collection (PBMCs) (none)
+```{r, fig.height=4, fig.width=6}
+merge(data.frame(pcs$x) %>% rownames_to_column("smpl"), sample.metadata.pbmc, by = "smpl") %>% mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1]) %>%
+  ggplot() + aes(x = PC1, y = PC2, col = src, shape = batch) + 
+  geom_point(size = 3) + 
+  scale_color_manual(values = c("#BCAF9C", "#773344"), 
+                     breaks = c("nih", "nwh"), labels = c("NIH", "Northwell Health"), name = "Sample Source")+
+  scale_shape_manual(values = c(17, 19), breaks = c("new", "old"), labels = c("2021", "2019/2020"),
+                     name = "Batch") + theme_classic() + xlab("PC 1") + ylab("PC 2") + 
+  ggtitle("PBMC samples") + 
+  theme(legend.text = element_text(size = 10))
+```
+
+__Suppl. Fig. 2(H)__
+PCA plot to look for separation by source of sample and year of collection (Monos) (none evident)
+```{r, fig.height=4, fig.width=6}
+merge(data.frame(pcs_monos$x) %>% rownames_to_column("smpl"), sample.metadata.pbmc, by = "smpl") %>% mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1]) %>%
+  ggplot() + aes(x = PC1, y = PC2, col = src, shape = batch) + 
+  geom_point(size = 3) + 
+  scale_color_manual(values = c("#BCAF9C", "#773344"), 
+                     breaks = c("nih", "nwh"), labels = c("NIH", "Northwell Health"), name = "Sample Source")+
+  scale_shape_manual(values = c(17, 19), breaks = c("new", "old"), labels = c("2021", "2019/2020"),
+                     name = "Batch") + theme_classic() + xlab("PC 1") + ylab("PC 2") + 
+  ggtitle("Monocyte samples") + 
+  theme(legend.text = element_text(size = 10))
+```
+
+
+__3.Integrate all samples across batch using Seurat RPCA pipeline__
+
+***
+***
+***
+
+Integration section - very resource (esp. memory) intensive - for ~400,000 cells, requires ~250GB RAM
+
+Integration of PBMC datasets - adapted from Seurat RPCA integration vignette
+
+```{r}
+source("src/integration.R", local = knitr::knit_global())
+```
+
+***
+***
+***
+
+__4. Clustering of integrated output, followed by cluster annotation__
+
+Post-integration analyses
+
+Take a quick look at how the integration and clustering worked - 
+PBMCs
+```{r}
+Idents(pbmc.combined) <- pbmc.combined$integrated_snn_res.0.2
+DimPlot(pbmc.combined, reduction = "umap", label = TRUE, repel = TRUE, raster = FALSE,  shuffle = TRUE) + NoLegend()
+```
+
+Take a quick look at how the integration and clustering worked - 
+Monocytes
+```{r}
+Idents(mono.combined) <- mono.combined$integrated_snn_res.0.2
+DimPlot(mono.combined, reduction = "umap", label = TRUE, repel = TRUE, raster = FALSE,  shuffle = TRUE) + NoLegend()
+```
+
+Cell-cycle scoring for both datasets, to evaluate how many cell-cycle phase-specific genes are expressed (gene module expression) 
+in each of the clusters of the integrated dataset, to evaluate whether cell cycle is driving the definition of any of the clusters
+observed in the integrated space
+```{r}
+DefaultAssay(pbmc.combined) <- "RNA"
+DefaultAssay(total.pbmc) <- "RNA"
+total.pbmc <- CellCycleScoring(total.pbmc, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+
+
+DefaultAssay(mono.combined) <- "RNA"
+DefaultAssay(total.mono) <- "RNA"
+total.mono <- CellCycleScoring(total.mono, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+```
+
+Convert UMAP coordinates to data.frame for ease of plotting using ggplot
+```{r}
+umap_metadata_total <- merge(data.frame(total.pbmc@reductions$umap@cell.embeddings) %>% rownames_to_column("cell"),
+                       total.pbmc@meta.data %>% rownames_to_column("cell"), by = "cell")
+
+umap_metadata_total_monos <- merge(data.frame(total.mono@reductions$umap@cell.embeddings) %>% rownames_to_column("cell"),
+                       total.mono@meta.data %>% rownames_to_column("cell"), by = "cell")
+```
+
+Assign cluster numbers to clust column
+```{r}
+umap_metadata_total$clust_num <- as.factor(Idents(total.pbmc))
+umap_metadata_total_monos$clust_num <- as.factor(Idents(total.mono))
+
+data2_num <- umap_metadata_total %>% group_by(clust_num) %>% select(UMAP_1, UMAP_2) %>% summarize_all(median)
+data2_num_mono <- umap_metadata_total_monos %>% group_by(clust_num) %>% select(UMAP_1, UMAP_2) %>% summarize_all(median)
+```
+
+(Not in suppl. figures)
+Is the source of the sample (Northwell Health or NIH) defining any of the clusters in the integrated space?
+```{r, fig.height=4, fig.width=6}
+set.seed(42)
+umap_metadata_total[sample(1:nrow(umap_metadata_total)), ] %>% 
+  ggplot() + aes(UMAP_1, UMAP_2) + 
+  geom_point(aes(col = src, fill = src), size=0.5, alpha = .8) +  
+  scale_color_manual(values = c("#BCAF9C", "#773344"), name = "Source", breaks = c("nih", "nwh"), labels = c("NIH", "Northwell Health")) +
+  scale_fill_manual(values = c("#BCAF9C", "#773344"), name = "Source", breaks = c("nih", "nwh"), labels = c("NIH", "Northwell Health")) +
+  theme_classic() + 
+  theme(legend.text = element_text(size = 12)) + 
+  guides(colour = guide_legend(override.aes = list(size=6))) + 
+  xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+__Suppl. Fig. 3(C)__
+Is mitochondrial RNA mapping fraction driving clustering?
+```{r, fig.height=4, fig.width=6}
+set.seed(42)
+umap_metadata_total[sample(1:nrow(umap_metadata_total)), ] %>% 
+  ggplot() + aes(UMAP_1, UMAP_2, col = pMT_RNA) + 
+  geom_point(size=0.5, alpha = .8) +  
+  scale_color_gradient(low = "#D8DEE8", high = "#3C4B67", guide = "colourbar", name = "% mito RNA") +
+  theme_classic() + 
+  theme(legend.text = element_text(size = 12, vjust = 0.5)) +
+  xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+__Suppl. Fig. 3(D)__
+Is cell-cycle-related gene expression driving clustering? (S-phase signature from Seurat vignette)
+```{r, fig.height=4, fig.width=6}
+set.seed(42)
+umap_metadata_total[sample(1:nrow(umap_metadata_total)), ] %>% 
+  ggplot() + aes(UMAP_1, UMAP_2, col = S.Score) + 
+  geom_point(size=0.5, alpha = .8) +  
+  scale_color_gradient(low = "#D8DEE8", high = "#3C4B67", guide = "colourbar", name = "S-phase signature") +
+  theme_classic() + 
+  theme(legend.text = element_text(size = 12, vjust = 0.5)) +
+  xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+Exclude clusters defined by technical or biological artifacts from PBMCs (reasons for exclusion detailed in code block)
+```{r}
+Idents(pbmc.combined) <- pbmc.combined$integrated_snn_res.0.2
+pbmc.combined <- subset(pbmc.combined, ident = 7, invert = TRUE) #stems primarily from only one source + low UMIs?
+pbmc.combined <- subset(pbmc.combined, ident = 14, invert = TRUE) #stems primarily from only one source + small + low UMIs?
+pbmc.combined <- subset(pbmc.combined, ident = 12, invert = TRUE) #high expression of cell-cycle markers - defined by active transcription
+DimPlot(pbmc.combined, reduction = "umap", label = TRUE, repel = TRUE, raster = FALSE) + NoLegend()
+```
+
+For PBMCs - Only use clusters which have more than 3,000 cells across all samples for all further analysis (~ 8 clusters total)
+```{r}
+used_cell_types <- names(which(colSums(table(pbmc.combined$smpl, pbmc.combined$clust)) > 3000))
+```
+
+For the isolated monocytes - since it is a purified cell type, subset to only those clusters which have more than 10% of all the cells assigned to them (exclude minor clusters which are likely contaminating cells)
+```{r}
+mono_counts <- table(mono.combined$smpl, mono.combined$integrated_snn_res.0.2)
+used_mono_clusters <- colnames(mono_counts)[colMeans(mono_counts/rowSums(mono_counts) * 100) > 10]
+```
+
+Assign cluster identity
+```{r}
+pbmc.combined <- RenameIdents(pbmc.combined, 
+                              `0` = "Naïve CD4+ T-cells", 
+                              `1` = "Effector CD4+ T-cells",
+                              `2` = "CD8+ T-cells",
+                              `3` = "CD14+ Monocytes",
+                              `4` = "B cells",
+                              `5` = "NK cells",
+                              `6` = "MAIT",
+                              `8` = "CD16+ Monocytes",
+                              `9` = "Platelets",
+                              `10` = "Dendritic cells",
+                              `11` = "Plasmacytoid DCs",
+                              `13` = "HSC")
+
+pbmc.combined$clust <- Idents(pbmc.combined)
+
+Idents(mono.combined) <- mono.combined$integrated_snn_res.0.2
+mono.combined <- RenameIdents(mono.combined,
+                              `0` = "(iso) CD14+ Monocytes",
+                              `1` = "(iso) CD14+ Monocytes",
+                              `2` = "(iso) CD16+ Monocytes")
+mono.combined$clust <- Idents(mono.combined)
+```
+
+Re-UMAP the isolated monocytes (with only 5 PCs due to low complexity of underlying data with respect to number of cell types/clusters)
+```{r}
+DefaultAssay(mono.combined) <- "RNA"
+mono.combined <- FindVariableFeatures(mono.combined, selection.method = "vst", nfeatures = 2000)
+mono.combined <- NormalizeData(mono.combined)
+mono.combined <- ScaleData(mono.combined)
+mono.combined <- RunPCA(mono.combined, seed.use = 42)
+DimPlot(pbmc.combined, reduction = "pca", group.by = "smpl_type") + ggtitle("PCA") + NoLegend()
+ElbowPlot(mono.combined)
+mono.combined <- RunUMAP(mono.combined, dims = 1:5, reduction = "pca", seed.use = 42)
+```
+
+Convert UMAP coordinates to a data.frame and calculate per-cluster median coordinates for placement of cluster labels
+```{r}
+umap_metadata <- merge(data.frame(pbmc.combined@reductions$umap@cell.embeddings) %>% rownames_to_column("cell"),
+                       pbmc.combined@meta.data %>% rownames_to_column("cell"), by = "cell")
+
+data2 <- umap_metadata %>% group_by(clust) %>% select(UMAP_1, UMAP_2) %>% summarize_all(median)
+
+umap_metadata_mono <- merge(data.frame(mono.combined@reductions$umap@cell.embeddings) %>% rownames_to_column("cell"),
+                       mono.combined@meta.data %>% rownames_to_column("cell"), by = "cell")
+
+data2_mono <- umap_metadata_mono %>% group_by(clust) %>% select(UMAP_1, UMAP_2) %>% summarize_all(median)
+```
+
+__Fig. 1(C)__
+Plot UMAP of PBMCs
+```{r, fig.height=8, fig.width=12}
+library(rcartocolor)
+cols <- rcartocolor::carto_pal(name = "Antique", n = 12)
+set.seed(1)
+cols <- sample(cols, length(cols))
+cols <- lighten(cols, amount = 0.15)
+names(cols) <- all_used_cell_types
+
+umap_metadata %>%
+  ggplot() + aes(UMAP_1, UMAP_2, col = factor(clust)) + 
+  geom_point(size=0.2) +  
+  geom_label_repel(data = data2, aes(label = clust), size = 9, max.overlaps = 5, seed = 42) + 
+  scale_color_manual(values = cols, breaks = names(cols)) +
+  theme_classic() + 
+  theme(legend.position = "none", 
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 18),
+        axis.text.y = element_text(size = 18)) + xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+__Fig. 1(D)__
+
+Dot plot depicting expression of canonical marker genes in PBMCs
+```{r, fig.height=6, fig.width=10}
+DotPlot(
+  pbmc.combined,
+  assay = "RNA",
+  features = c("CCR7", "ICOS", "CD8A", "LYZ", "S100A9", "IGHM", "CD79A", "GNLY", "NKG7",
+               "KLRB1", "FCGR3A", "PPBP", "FCER1A", "IL3RA", "CD34"),
+  cols = c("grey90", "midnightblue"),
+  col.min = -5.5,
+  col.max = 5.5,
+  dot.min = 0,
+  dot.scale = 6,
+  idents = NULL,
+  group.by = NULL,
+  split.by = NULL,
+  cluster.idents = FALSE,
+  scale = TRUE,
+  scale.by = "radius",
+  scale.min = NA,
+  scale.max = NA
+) + theme(axis.text.x = element_text(angle = 90, size = 18, vjust = 0.5),
+          axis.text.y = element_text(size = 18, hjust = 0.5)) + xlab("") + ylab("")
+```
+
+__Suppl. Fig. 3(A)__
+Plot UMAP of isolated monocytes
+```{r, fig.height=8, fig.width=12}
+cols <- list("(iso) CD14+ Monocytes" = "#786A8D", "(iso) CD16+ Monocytes" = "#E4BA77")
+
+umap_metadata_mono %>%
+  ggplot() + aes(UMAP_1, UMAP_2, col = factor(clust)) + 
+  geom_point(size=0.2) +  
+  geom_label_repel(data = data2_mono, aes(label = clust), size = 6, max.overlaps = 5, seed = 42) + 
+  scale_color_manual(values = cols, breaks = names(cols)) +
+  theme_classic() + 
+  theme(legend.position = "none", 
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 18),
+        axis.text.y = element_text(size = 18)) + xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+__Suppl. Fig. 3(B)__
+Dot plot depicting expression of canonical marker genes in isolated monocytes
+```{r, fig.height=4, fig.width=6}
+DotPlot(
+  mono.combined,
+  assay = "RNA",
+  features = c("CD14", "LYZ", "CD68", "FCGR3A"),
+  cols = c("grey90", "midnightblue"),
+  col.min = -5.5,
+  col.max = 5.5,
+  dot.min = 0,
+  dot.scale = 6,
+  idents = NULL,
+  group.by = NULL,
+  split.by = NULL,
+  cluster.idents = FALSE,
+  scale = TRUE,
+  scale.by = "radius",
+  scale.min = NA,
+  scale.max = NA
+) + theme(axis.text.x = element_text(angle = 90)) + xlab("") + ylab("")
+```
+
+__Suppl. Fig. 3(E)__
+Verify if source of sample collection (NIH or Northwell Health) is driving clustering
+```{r}
+set.seed(42)
+umap_metadata[sample(1:nrow(umap_metadata)), ] %>% 
+  ggplot() + aes(UMAP_1, UMAP_2) + 
+  geom_point(aes(col = src, fill = src), size=0.5, alpha = .8) +  
+  scale_color_manual(values = c("#BCAF9C", "#773344"), name = "Source", breaks = c("nih", "nwh"), labels = c("NIH", "Northwell Health")) +
+  scale_fill_manual(values = c("#BCAF9C", "#773344"), name = "Source", breaks = c("nih", "nwh"), labels = c("NIH", "Northwell Health")) +
+  theme_classic() + 
+  theme(legend.text = element_text(size = 12)) + 
+  guides(colour = guide_legend(override.aes = list(size=6))) + 
+  xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+__Suppl. Fig. 3(F)__
+Verify if year of sample collection (2019/2020 or 2021 is driving clustering)
+```{r}
+set.seed(42)
+umap_metadata[sample(1:nrow(umap_metadata)), ] %>% 
+  ggplot() + aes(UMAP_1, UMAP_2, col = batch, fill = batch) + 
+  geom_point(size=0.5, alpha = .8) +  
+  scale_color_manual(values = c("#53668D", "seagreen3"), name = "Batch", breaks = c("new", "old"), labels = c("2021", "2019/2020")) +
+  scale_fill_manual(values = c("#53668D", "seagreen3"), name = "Batch", breaks = c("new", "old"), labels = c("2021", "2019/2020")) +
+  theme_classic() + 
+  theme(legend.text = element_text(size = 12)) + 
+  guides(colour = guide_legend(override.aes = list(size=6))) + 
+  xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+
+__5. Differential abundance analysis__
+
+***
+Differential abundance analysis - __Fig. 1(E)__
+***
+Differential abundance analysis - only for the PBMCs as they have a higher diversity of cell types relative to the
+isolated monocytes, where any differential abundance may be more prone to be driven by sampling biases/purification issues
+```{r, fig.height=8, fig.width=8}
+library(rstatix)
+tmp <- data.frame(table(pbmc.combined$smpl, Idents(pbmc.combined))) %>% 
+  mutate(smpl = Var1, cell_type = Var2, n = Freq) %>%
+  group_by(Var1) %>% 
+  mutate(Freq = Freq / sum(Freq) * 100) %>%
+  ungroup %>% 
+  group_by(cell_type) %>% 
+  summarise(smpl = smpl, cell_type = cell_type, n = n, avg = mean(Freq), Freq = Freq, .groups = "keep") %>%
+  filter(avg > 5) %>% 
+  mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1]) %>%
+  ungroup %>%
+  mutate(smpl_type = fct_recode(smpl_type, Control = "control", Carrier = 'carrier', Proband = "proband")) %>%
+  mutate(smpl_type = factor(smpl_type, levels = SMPL_TYPES))
+
+tmp_stats <- tmp %>% group_by(cell_type) %>% t_test(Freq ~ smpl_type) %>% adjust_pvalue(p.col = "p", method = "BH")
+
+tmp_stats <- tmp_stats %>% add_significance(p.col = "p.adj") %>% add_y_position()
+
+tmp %>%
+  ggplot() + 
+  geom_boxplot(aes(x = smpl_type, 
+      y = Freq, 
+      fill = smpl_type, alpha = .6), outlier.shape = NA) + 
+  facet_wrap(~ cell_type) + geom_jitter(aes(x = smpl_type, 
+      y = Freq, 
+      col = smpl_type, alpha = .6)) +
+  xlab("") + ylab("Proportion of total cells (%)") + 
+  scale_fill_manual(values = c("steelblue", "springgreen4", "salmon")) +
+  scale_color_manual(values = c("steelblue", "springgreen4", "salmon")) + 
+  stat_pvalue_manual(tmp_stats, label = "p.adj.signif", color = "grey40", hide.ns = TRUE, size = 6) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1)))
+```
+
+__6. Differential expression analysis - probands vs controls using DESeq2__
+
+__Differential expression analysis - probands vs controls__
+
+
+Subset combined Seurat objects to only probands and controls, excluding carriers for this step
+```{r}
+mono.combined.no.carriers <- subset(mono.combined, smpl_type != "carrier")
+pbmc.combined.no.carriers <- subset(pbmc.combined, smpl_type != "carrier")
+```
+
+```{r}
+source("src/diff_exp.R", local = knitr::knit_global())
+```
+
+__Fig. 1(F)__
+
+Generate volcano plots on a per-cluster level for both the PBMC and isolated monocyte datasets
+```{r, fig.height=15, fig.width=8.5}
+volcano_plots <- list()
+a <- lapply(all_used_cell_types, function(i){
+  l2fc_thresh = 1.0
+  padj_thresh = 0.05
+  
+  filt_res_tbl <-
+    excludeSexChrGenes(all_DE[[i]]$prob_con, filt_mapping) %>% 
+    filter(!is.na(padj)) 
+  
+  volcano_plots[[i]] <<- plotVolcano(filt_res_tbl, title = i, padj_thresh = padj_thresh, l2fc_thresh = l2fc_thresh)
+})
+
+cowplot::plot_grid(plotlist = volcano_plots, ncol = 2)
+```
+
+__8. Definition of cluster-specific signatures in X-CGD probands__
+
+up sigs and enrich proband-control
+```{r}
+up_sigs <- list()
+y <- lapply(used_cell_types, function(i){
+  up_sigs[[i]] <<- excludeSexChrGenes(cluster_DE_results[[i]]$prob_con, filt_mapping) %>% 
+    filter(!is.na(padj)) %>%
+    filter(log2FoldChange > 0) %>%
+    arrange(-log2FoldChange) %>% 
+    top_n(100, wt = log2FoldChange) %>% 
+    dplyr::select(gene) %>% "[["(1)
+})
+
+down_sigs <- list()
+y <- lapply(used_cell_types, function(i){
+  down_sigs[[i]] <<- excludeSexChrGenes(cluster_DE_results[[i]]$prob_con, filt_mapping) %>% 
+    filter(!is.na(padj)) %>%
+    filter(log2FoldChange < 0) %>%
+    arrange(log2FoldChange) %>% 
+    top_n(100, wt = log2FoldChange) %>% 
+    dplyr::select(gene) %>% "[["(1)
+})
+```
+
+up sigs and enrich proband-control (mono)
+```{r}
+#used_cell_types <- levels(Idents(pbmc.combined))
+up_sigs_mono <- list()
+
+y <- lapply(used_cell_types_mono, function(i){
+  up_sigs_mono[[i]] <<- excludeSexChrGenes(cluster_DE_results_mono[[i]]$prob_con, filt_mapping) %>% 
+    filter(!is.na(padj)) %>%
+    filter(log2FoldChange > 0) %>%
+    arrange(-log2FoldChange) %>% 
+    top_n(100, wt = log2FoldChange) %>% 
+    dplyr::select(gene) %>% "[["(1)
+})
+
+down_sigs_mono <- list()
+
+y <- lapply(used_cell_types_mono, function(i){
+  down_sigs_mono[[i]] <<- excludeSexChrGenes(cluster_DE_results_mono[[i]]$prob_con, filt_mapping) %>% 
+    filter(!is.na(padj)) %>%
+    arrange(-log2FoldChange) %>% 
+    top_n(100, wt = log2FoldChange) %>% 
+    dplyr::select(gene) %>% "[["(1)
+})
+```
+
+Pool together PBMC and isolated monocyte up-regulated signatures
+```{r}
+all_up_sigs <- c(up_sigs, up_sigs_mono)
+```
+
+__Suppl. Fig. 4(A)__
+Aggregate signature expression of top 100 genes in each cluster and distribution of p-values of expression of cluster-specific in all other clusters (probands vs controls)
+```{r, fig.height=16, fig.width=6}
+all_comps_prob.con <- data.frame()
+x <- lapply(names(all_up_sigs), function(i){
+  tmp <- 
+    pbmc.mono.expr.aggr.corr %>%
+    mutate(clust = factor(clust, levels = cell_order)) %>%
+    filter(clust %in% all_used_cell_types) %>%
+    filter(gene %in% all_up_sigs[[i]]) %>% 
+    group_by(clust, gene) %>%
+    filter(sd(value) != 0) %>%
+    mutate(z = (value - mean(value))/sd(value)) %>%
+    ungroup %>%
+    distinct %>%
+    group_by(clust, smpl) %>%
+    mutate(s = sum(z)) %>%
+    ungroup %>% 
+    dplyr::select(clust, smpl, smpl_type, s) %>%
+    distinct %>% mutate(smpl_type = fct_recode(smpl_type, "Control" = "control", "Proband" = "proband")) %>% mutate(sig = i)
+  
+  all_comps_prob.con <<- rbind(all_comps_prob.con, tmp)
+})
+
+all_comps_prob.con <- all_comps_prob.con %>% mutate(sig = factor(sig, levels = cell_order))
+
+all_comp_prob.con_stats <- all_comps_prob.con %>% group_by(clust, sig) %>% t_test(s ~ smpl_type) %>% adjust_pvalue(p.col = "p", method = "BH")
+all_comp_prob.con_stats <- all_comp_prob.con_stats %>% add_significance(p.col = "p.adj") %>% add_y_position()
+all_comps_prob.con <- all_comps_prob.con %>% mutate(sig = factor(sig, levels = cell_order))
+set.seed(42)
+p1 <- all_comps_prob.con %>% filter(clust == sig) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = smpl_type, y = s, fill = smpl_type, alpha = .6), outlier.shape = NA) + 
+  geom_jitter(aes(x = smpl_type, y = s, col = smpl_type, alpha = .6)) +
+  facet_wrap(~clust, ncol = 1) + 
+  theme_bw() + 
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) + 
+  stat_pvalue_manual(data = all_comp_prob.con_stats %>% filter(clust == sig), label = "p.adj.signif", color = "grey60", hide.ns = TRUE, size = 6) + 
+  scale_fill_manual(values = c("steelblue", "salmon"), breaks = c("Control", "Proband")) +
+  scale_color_manual(values = c("steelblue", "salmon"), breaks = c("Control", "Proband")) +
+  xlab("") + 
+  ylab("Sum of gene-level z-scores")
+
+p2 <- all_comp_prob.con_stats %>% filter(clust != sig) %>% ggplot() + 
+  aes(x = -log2(p.adj)) + geom_histogram(aes(y = ..density.., alpha = .6), binwidth = 1.0) + geom_density(lwd = 1) + 
+  facet_wrap(~clust, ncol = 1) + 
+  geom_vline(xintercept = -log2(0.05), linetype = "dotted", color = "steelblue") + 
+  xlab("-Log2(adj. p)") + 
+  ylab("Distribution (density)")
+
+p1 + p2
+```
+
+__7. Geneset enrichment analysis of differentially expressed genes in X-CGD probands vs controls__
+
+__Geneset enrichment analysis__
+
+Filter genesets to only include genes which are used in this analysis - i.e. set the right universe for the enrichment analysis
+```{r}
+all_genes <- unique(cluster_DE_results$`CD14+ Monocytes`$prob_con$gene)
+
+GO_subset <- list()
+x <- lapply(names(GO_complete), function(i){
+  GO_subset[[i]] <<- GO_complete[[i]][GO_complete[[i]] %in% all_genes]
+})
+```
+
+Parallelized implementation of enrichment using custom-built genesetEnrichment function from custom package utility.functions - can be extended to other genesets (KEGG/HPO etc.)
+```{r}
+gc()
+
+mw_enrichment_tbls <- data.frame()
+x <- mclapply(all_used_cell_types, FUN = function(i){
+  rbind(genesetEnrichment(ranked_list = prepRankedGeneList(excludeSexChrGenes(all_DE[[i]]$prob_con, filt_mapping) %>% filter(!is.na(padj))), 
+                                gene_set_list = GO_subset, max_size_gene_set = 100,
+                                hypothesis = "greater") %>% mutate(cluster = i, dir = "up"),
+  genesetEnrichment(ranked_list = prepRankedGeneList(excludeSexChrGenes(all_DE[[i]]$prob_con, filt_mapping) %>% filter(!is.na(padj))), 
+                                gene_set_list = GO_subset, max_size_gene_set = 100,
+                                hypothesis = "less") %>% mutate(cluster = i, dir = "down"))
+}, mc.cores = 2)
+
+
+mw_enrichment_tbls <- Reduce(rbind, x)
+```
+
+__Fig. 2(A)__
+
+Depiction of genesets which are significantly enriched across at least 5 clusters (shared enrichment signature)
+```{r, fig.height=9.6, fig.width=16.75}
+broad_sigs <- 
+  mw_enrichment_tbls %>% 
+  filter(dir == "up" & padj < 0.05) %>% 
+  group_by(geneset) %>% 
+  summarise(n = n(), padj = padj, cluster = cluster) %>% 
+  ungroup %>%
+  filter(n > 5) %>%
+  dplyr::select(geneset) %>% distinct %>% "[["(1)
+
+
+tmp <- mw_enrichment_tbls %>% filter(geneset %in% broad_sigs[1:50] & dir == "up")
+
+min_p <- min(tmp$padj)
+max_p <- max(tmp$padj)
+tmp$geneset <- str_split(tmp$geneset, "GO_", simplify = TRUE)[, 2]
+tmp$geneset <- str_replace_all(tmp$geneset, "_", " ")
+
+tmp %>% 
+  group_by(geneset) %>% 
+  summarise(cluster = cluster, padj = padj, sum_padj = sum(-log2(padj)), .groups = "drop") %>% ungroup %>%
+  ggplot() + 
+  geom_point(aes(x = factor(cluster, levels = cell_order), y = reorder(geneset, sum_padj), color = -log2(padj), size = -log2(padj))) + 
+  scale_colour_gradientn(name = "- Log2 adj. p", colours=c("steelblue", "whitesmoke", "salmon"),
+                         values=rescale(c(-log2(max_p), -log2(0.05), -log2(min_p))), breaks = c(0, -log2(0.05), 10, 20), 
+                         labels = c(0, "4.32 (p=0.05)", 10, 20)) +
+  xlab("") + 
+  ylab("") + 
+  scale_size_continuous(name = "- Log2 adj. p", breaks = c(0, 4.32, 10, 20), labels = c(0, "4.32 (p=0.05)", 10, 20)) + 
+  scale_y_discrete(position = "right") +
+  theme_bw() +
+  theme(legend.position = "left")
+```
+
+Evaluate which terms are only enriched in one of the clusters (cluster-specific enrichment, which is not shared across clusters)
+```{r}
+singleton_enrich <- mw_enrichment_tbls %>% filter(dir == "up") %>% filter(cluster %in% used_cell_types) %>% 
+  filter(padj < 0.05) %>% group_by(geneset) %>% summarise(n = n()) %>% filter(n == 1) %>% dplyr::select(geneset) %>% "[["(1)
+```
+
+List of terms to label in cluster-specific enrichment subfigure (supplement)
+```{r}
+terms_to_label <-c(
+  "ACUTE INFLAMMATORY RESPONSE",
+  "RESPONSE TO FUNGUS",
+  "INTERLEUKIN 10 PRODUCTION",
+  "POSITIVE REGULATION OF INTERLEUKIN 1 PRODUCTION",
+  "POSITIVE REGULATION OF INTERLEUKIN 4 PRODUCTION",
+  "POSITIVE REGULATION OF INTERLEUKIN 6 PRODUCTION",
+  "REGULATION OF SUPEROXIDE ANION GENERATION",
+  "CELLULAR EXTRAVASATION",
+  "REGULATION OF SUPEROXIDE METABOLIC PROCESS",
+  "REACTIVE OXYGEN SPECIES BIOSYNTHETIC PROCESS",
+  "REGULATION OF NITRIC OXIDE BIOSYNTHETIC PROCESS",
+  "INNATE IMMUNE RESPONSE ACTIVATING SIGNAL TRANSDUCTION",
+  "DEFENSE RESPONSE TO VIRUS",
+  "RESPONSE TO VIRUS",
+  "RESPONSE TO INTERLEUKIN 1")
+ c("POSITIVE REGULATION OF MACROPHAGE MIGRATION",
+                    "OXIDOREDUCTASE ACTIVITY ACTING ON NAD P H OXYGEN AS ACCEPTOR",
+                    "MYD88 DEPENDENT TOLL LIKE RECEPTOR SIGNALING PATHWAY",
+                    "MACROPHAGE ACTIVATION",
+                    "RESPONSE TO CADMIUM ION",
+                    "REGULATION OF SUPEROXIDE ANION GENERATION",
+                    "INTEGRIN ACTIVATION",
+                    "INTERLEUKIN 35 MEDIATED SIGNALING PATHWAY",
+                    "INTERLEUKIN 27 MEDIATED SIGNALING PATHWAY",
+                    "CELLULAR RESPONSE TO INTERFERON BETA",
+                    "REGULATION OF T HELPER 17 TYPE IMMUNE RESPONSE",
+                    "CYTOPLASMIC PATTERN RECOGNITION RECEPTOR SIGNALING PATHWAY",
+                    "ACTIVATION OF INNATE IMMUNE RESPONSE",
+                    "DEFENSE RESPONSE TO BACTERIUM",
+                    "POSITIVE REGULATION OF INTERLEUKIN 12 PRODUCTION",
+                    "T CELL DIFFERENTIATION INVOLVED IN IMMUNE RESPONSE",
+                    "POSITIVE REGULATION OF INTERLEUKIN 6 PRODUCTION",
+                    "PATTERN RECOGNITION RECEPTOR ACTIVITY",
+                    "LEUKOCYTE MIGRATION INVOLVED IN INFLAMMATORY RESPONSE")
+```
+
+__Suppl. Fig. 4(C)__
+
+Subfigure to depict terms which are enriched in only one cluster (cluster-specific GO term enrichment)
+```{r, fig.height=10, fig.width=12}
+tmp <- mw_enrichment_tbls %>% filter(dir == "up") %>% filter(geneset %in% singleton_enrich & cluster %in% used_cell_types) %>% pivot_wider(id_cols = geneset, names_from = cluster, values_from = padj)
+
+tmp$geneset <- str_split(tmp$geneset, "GO_", simplify = TRUE)[, 2]
+tmp$geneset <- str_replace_all(tmp$geneset, "_", " ")
+
+tmp <- tmp %>% column_to_rownames("geneset")
+
+tmp[is.na(tmp)] <- 1
+
+col_fun = colorRamp2(c(0, -log2(0.05), max(-log2(tmp))), c("steelblue", "white", "salmon"))
+
+tmp <- tmp[, used_cell_types]
+
+c_anno <- anno_mark(at = match(terms_to_label, rownames(tmp)), labels = terms_to_label, which = "row")
+
+ComplexHeatmap::Heatmap(-log2(data.matrix(tmp)), cluster_columns = FALSE, col = col_fun, name = "-Log2 adj. p",
+                         show_column_dend = FALSE) + rowAnnotation(mark = c_anno)
+```
+
+__9. Evaluate expression of cluster-specific signatures in X-CGD carriers (incl. correlation with DHR/NOI scores)__
+
+__Evaluation of carriers__
+
+First, subset the two objects into male (probands and male controls) and female (carriers and female controls) subsets 
+```{r}
+male_data <- subset(pbmc.combined, (Sex == "Male"))
+female_data <- subset(pbmc.combined, Sex == "Female")
+
+male_mono <- subset(mono.combined, Sex == "Male")
+female_mono <- subset(mono.combined, Sex == "Female")
+```
+
+__Male-specific DE__
+
+Parallelized version of the evaluation of the male differential expression (for PBMCs)
+```{r}
+male_DE <- list()
+x <- mclapply(X = used_cell_types, FUN = function(i){
+  male_DE[[i]] <<- analyze_DE_shrunk_prob_con(seurat_obj = male_data, cluster = i)
+}, mc.cores = 8)
+
+male_DE <- x
+names(male_DE) <- used_cell_types
+
+male_DE_corr <- list()
+x <- lapply(X = names(male_DE), function(i){
+  l2fc_table <- male_DE[[i]]$prob_con
+  fcs <- l2fc_table %>% filter(!is.na(padj)) %>% dplyr::select(log2FoldChange) %>% "[["(1)
+  mean_fc <- mean(fcs)
+  sd_fc <- sd(fcs)
+  to_corr <- l2fc_table %>% 
+    filter(!is.na(padj)) %>% filter(abs(log2FoldChange) > mean_fc + (40 * sd_fc)) %>% dplyr::select(gene) %>% "[["(1)
+  
+  fcs <- l2fc_table %>% filter(!is.na(padj) & (gene %notin% to_corr)) %>% dplyr::select(log2FoldChange) %>% "[["(1)
+  
+  print(paste("correcting ", length(to_corr), " genes for cluster ", i, sep = ""))
+  
+  if (length(to_corr) > 0){
+    for(j in to_corr){
+      orig_fc <- l2fc_table[l2fc_table$gene == j, "log2FoldChange"]
+      corr_fc <- ifelse(orig_fc > 0, max(fcs) + 1e-6, min(fcs) - 1e-6)
+      l2fc_table[l2fc_table$gene == j, "log2FoldChange"] <- corr_fc
+    }
+  }
+  male_DE_corr[[i]] <<- l2fc_table
+})
+
+x <- lapply(names(male_DE), function(i){
+  male_DE[[i]]$prob_con <<- male_DE_corr[[i]]
+})
+```
+
+Parallelized version of the evaluation of the male differential expression (for isolated monocytes)
+```{r}
+male_DE_mono <- list()
+x <- mclapply(X = used_cell_types_mono, FUN = function(i){
+  male_DE_mono[[i]] <<- analyze_DE_shrunk_prob_con(seurat_obj = male_mono, cluster = i)
+}, mc.cores = 8)
+
+male_DE_mono <- x
+names(male_DE_mono) <- used_cell_types_mono
+
+male_DE_mono_corr <- list()
+x <- lapply(X = names(male_DE_mono), function(i){
+  l2fc_table <- male_DE_mono[[i]]$prob_con
+  fcs <- l2fc_table %>% filter(!is.na(padj)) %>% dplyr::select(log2FoldChange) %>% "[["(1)
+  mean_fc <- mean(fcs)
+  sd_fc <- sd(fcs)
+  to_corr <- l2fc_table %>% 
+    filter(!is.na(padj)) %>% filter(abs(log2FoldChange) > mean_fc + (40 * sd_fc)) %>% dplyr::select(gene) %>% "[["(1)
+  
+  fcs <- l2fc_table %>% filter(!is.na(padj) & (gene %notin% to_corr)) %>% dplyr::select(log2FoldChange) %>% "[["(1)
+  
+  print(paste("correcting ", length(to_corr), " genes for cluster ", i, sep = ""))
+  
+  if (length(to_corr) > 0){
+    for(j in to_corr){
+      orig_fc <- l2fc_table[l2fc_table$gene == j, "log2FoldChange"]
+      corr_fc <- ifelse(orig_fc > 0, max(fcs) + 1e-6, min(fcs) - 1e-6)
+      l2fc_table[l2fc_table$gene == j, "log2FoldChange"] <- corr_fc
+    }
+  }
+  male_DE_mono_corr[[i]] <<- l2fc_table
+})
+
+x <- lapply(names(male_DE_mono), function(i){
+  male_DE_mono[[i]]$prob_con <<- male_DE_mono_corr[[i]]
+})
+```
+
+Pool both PBMCs and monocytes together
+```{r}
+all_male_DE <- c(male_DE, male_DE_mono)
+```
+
+normalized counts for PBMCs
+```{r}
+assay = "RNA"
+slot = "counts"
+corrected_mats <- list()
+x <- lapply(used_cell_types, FUN = function(i){
+  
+  seurat_obj <- subset(pbmc.combined, ident = i)
+  expr <- AggregateExpression(seurat_obj, assays = assay, slot = slot, group.by = "smpl")
+  counts <- round(x = expr$RNA, digits = 0)
+  meta.data <- seurat_obj@meta.data
+  rownames(meta.data) <- NULL
+  meta.data <- meta.data %>% 
+    dplyr::select(nUMI, nGene, smpl, src, batch, pMT_RNA, smpl_type, log10GenesPerUMI, nCount_RNA, nFeature_RNA, Sex) %>% 
+    group_by(smpl) %>% 
+    mutate(nUMI = mean(nUMI), 
+           nGene = mean(nGene), 
+           pMT_RNA = mean(pMT_RNA), 
+           log10GenesPerUMI = mean(log10GenesPerUMI), 
+           nCount_RNA = mean(nCount_RNA), 
+           nFeature_RNA = mean(nFeature_RNA)) %>% distinct %>% column_to_rownames("smpl")
+  
+  dds <- DESeqDataSetFromMatrix(countData = counts[, rownames(meta.data)], colData = meta.data, design = ~ smpl_type)
+  
+  dds <- estimateSizeFactors(dds)
+  
+  count_mat <- counts(dds, normalized = TRUE)
+  
+  cor_data <- merge(meta.data %>% 
+      rownames_to_column("smpl") %>% 
+      dplyr::select(smpl, src, batch, smpl_type),
+    data.frame(count_mat) %>% 
+      rownames_to_column("gene") %>% 
+      melt %>% 
+      dplyr::rename(smpl = variable))
+  
+  corrected_mats[[i]] <<- cor_data
+})
+```
+
+```{r}
+expr.aggr.corr_total <- data.frame()
+z <- lapply(names(corrected_mats), function(i){
+  expr.aggr.corr_total <<- rbind(expr.aggr.corr_total, corrected_mats[[i]] %>% mutate(clust = i))
+})
+```
+
+normalized counts for monocytes
+```{r}
+assay = "RNA"
+slot = "counts"
+corrected_mats_mono <- list()
+x <- lapply(used_cell_types_mono, FUN = function(i){
+  
+  seurat_obj <- subset(mono.combined, ident = i)
+  expr <- AggregateExpression(seurat_obj, assays = assay, slot = slot, group.by = "smpl")
+  counts <- round(x = expr$RNA, digits = 0)
+  meta.data <- seurat_obj@meta.data
+  rownames(meta.data) <- NULL
+  meta.data <- meta.data %>% 
+    dplyr::select(nUMI, nGene, smpl, src, batch, pMT_RNA, smpl_type, log10GenesPerUMI, nCount_RNA, nFeature_RNA, Sex) %>% 
+    group_by(smpl) %>% 
+    mutate(nUMI = mean(nUMI), 
+           nGene = mean(nGene), 
+           pMT_RNA = mean(pMT_RNA), 
+           log10GenesPerUMI = mean(log10GenesPerUMI), 
+           nCount_RNA = mean(nCount_RNA), 
+           nFeature_RNA = mean(nFeature_RNA)) %>% distinct %>% column_to_rownames("smpl")
+  
+  dds <- DESeqDataSetFromMatrix(countData = counts[, rownames(meta.data)], colData = meta.data, design = ~ smpl_type)
+  
+  dds <- estimateSizeFactors(dds)
+  
+  count_mat <- counts(dds, normalized = TRUE)
+  
+  cor_data <- merge(meta.data %>% 
+      rownames_to_column("smpl") %>% 
+      dplyr::select(smpl, src, batch, smpl_type),
+    data.frame(count_mat) %>% 
+      rownames_to_column("gene") %>% 
+      melt %>% 
+      dplyr::rename(smpl = variable))
+  
+  corrected_mats_mono[[i]] <<- cor_data
+})
+```
+
+```{r}
+expr.aggr.corr_mono_total <- data.frame()
+z <- lapply(names(corrected_mats_mono), function(i){
+  expr.aggr.corr_mono_total <<- rbind(expr.aggr.corr_mono_total, corrected_mats_mono[[i]] %>% mutate(clust = i))
+})
+```
+
+```{r}
+pbmc.mono.expr.aggr.corr_total <- rbind(expr.aggr.corr_total, expr.aggr.corr_mono_total)
+```
+
+Define male-only cluster-specific signatures for classification experiment
+```{r}
+up_sigs_male <- list()
+y <- lapply(used_cell_types, function(i){
+  up_sigs_male[[i]] <<- male_DE[[i]]$prob_con %>% 
+    filter(!is.na(padj)) %>% 
+    filter(log2FoldChange > 0) %>%
+    arrange(-log2FoldChange) %>% 
+    top_n(100, wt = log2FoldChange) %>% 
+    dplyr::select(gene) %>% "[["(1)
+})
+
+up_sigs_male_mono <- list()
+y <- lapply(used_cell_types_mono, function(i){
+  up_sigs_male_mono[[i]] <<- male_DE_mono[[i]]$prob_con %>% 
+    filter(!is.na(padj)) %>% 
+    filter(log2FoldChange > 0) %>%
+    arrange(-log2FoldChange) %>% 
+    top_n(100, wt = log2FoldChange) %>% 
+    dplyr::select(gene) %>% "[["(1)
+})
+```
+
+```{r}
+all_male_up_sigs <- c(up_sigs_male, up_sigs_male_mono)
+```
+
+__Fig. 2(B)__
+
+Evaluate the aggregate expression of cluster-specific proband-derived signatures in the female carriers. 
+This is calculated using pseudo-bulk aggregates. Importantly, also evaluate whether the aggregate 
+expression level of these signatures is correlated with X-skew as measured by the DHR assay which is a 
+proxy for the residual oxidative burst capacity of the carrier.
+```{r, fig.height=16, fig.width=7}
+all_comps <- data.frame()
+x <- lapply(names(all_up_sigs), function(i){
+  tmp <- 
+    pbmc.mono.expr.aggr.corr_total %>%
+    mutate(clust = factor(clust, levels = cell_order)) %>%
+    filter(clust %in% all_used_cell_types) %>%
+    filter(gene %in% all_up_sigs[[i]]) %>% 
+    group_by(clust, gene) %>%
+    filter(sd(value) != 0) %>%
+    mutate(z = (value - mean(value))/sd(value)) %>%
+    ungroup %>%
+    distinct %>%
+    group_by(clust, smpl) %>%
+    mutate(s = sum(z)) %>%
+    ungroup %>% 
+    dplyr::select(smpl, smpl_type, clust, s) %>%
+    distinct %>% mutate(smpl_type = fct_recode(smpl_type, "Control" = "control", "Carrier" = "carrier", "Proband" = "proband")) %>% 
+    mutate(smpl_type = factor(smpl_type, levels = SMPL_TYPES)) %>%
+    mutate(sig = i)
+  
+  all_comps <<- rbind(all_comps, tmp)
+})
+
+all_comps <- all_comps %>% mutate(sig = factor(sig, levels = cell_order))
+
+all_comps_stats <- all_comps %>% group_by(clust, sig) %>% t_test(s ~ smpl_type) %>% adjust_pvalue(p.col = "p", method = "BH")
+all_comps_stats <- all_comps_stats %>% add_significance(p.col = "p.adj") %>% add_y_position()
+
+agg_var_skew <- data.frame()
+
+x <- lapply(names(all_up_sigs), function(j){
+  tmp <- 
+    pbmc.mono.expr.aggr.corr_total %>% filter(clust == j) %>%
+    filter(smpl_type == "carrier") %>%
+    filter(gene %in% all_up_sigs[[j]]) %>%
+    group_by(gene) %>%
+    filter(sd(value) != 0) %>%
+    mutate(z = (value - mean(value))/sd(value)) %>%
+    ungroup %>%
+    distinct %>%
+    group_by(smpl) %>%
+    mutate(s = sum(z)) %>%
+    ungroup %>%
+    dplyr::select(smpl, smpl_type, clust, s) %>%
+    distinct
+  
+  agg_var_skew <<- rbind(agg_var_skew, tmp)
+
+})
+
+tmp <- merge(sample.metadata.pbmc, agg_var_skew, by = "smpl")
+
+
+p1 <- all_comps %>% filter(clust == sig) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = smpl_type, y = s, fill = smpl_type, alpha = .6), outlier.shape = NA) + 
+  geom_jitter(aes(x = smpl_type, y = s, col = smpl_type, alpha = .6)) +
+  facet_wrap(~clust, ncol = 1) + 
+  theme_bw() + 
+  scale_y_continuous(expand = expansion(mult = c(0.2, 0.2))) + 
+  stat_pvalue_manual(data = all_comps_stats %>% filter(clust == sig), label = "p.adj.signif", color = "grey60", hide.ns = TRUE, size = 6) + 
+ scale_fill_manual(values = c("steelblue", "springgreen4", "salmon"), breaks = SMPL_TYPES) +
+  scale_color_manual(values = c("steelblue", "springgreen4", "salmon"), breaks = SMPL_TYPES) +
+  theme(legend.position = "none", 
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12, angle = 45, vjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        #strip.text = element_text(size = 8),
+        strip.background = element_blank(),
+        strip.text.x = element_text(size = 12, margin = margin(.2, 0, .1, 0, "cm")),
+        strip.text.y = element_text(size = 12, margin = margin(.2, 0, .1, 0, "cm")),
+        plot.title = element_text(hjust = 0.5, size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  xlab("") + ylab("Signature Expression")
+
+p2 <- all_comps %>% filter(clust != sig) %>% 
+  mutate(status = case_when(
+    smpl_type == "Control" ~ 0,
+    smpl_type == "Carrier" ~ 0.5,
+    smpl_type == "Proband" ~ 1)) %>% 
+  group_by(clust, sig) %>% 
+  summarise(p = cor(s, status, method = "spearman")) %>%
+  ungroup %>%
+  #mutate(p = p.adjust(p, method = "BH")) %>%
+  ggplot() + 
+  aes(x = (p)) + 
+  geom_density() + 
+  facet_wrap(~ clust, ncol = 1) + 
+  #geom_vline(xintercept = -log10(0.05), linetype = "dotted", color = "steelblue") + 
+  xlab("Spearman's ρ") + ylab("Distribution (density)")
+
+p3 <- tmp %>% mutate(clust = factor(clust, levels = cell_order))  %>%
+  ggplot() + aes(x = DHR, y = s) + geom_point(col = "springgreen4", size = 2.5) + geom_smooth(alpha = 0.1, method = "glm", color = "steelblue") + 
+  facet_wrap(~clust, ncol = 1) + stat_cor() + theme_bw() + 
+  theme(legend.position = "none", 
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12, angle = 45, vjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        #strip.text = element_text(size = 8),
+        strip.background = element_blank(),
+        strip.text.x = element_text(size = 12, margin = margin(.2, 0, .1, 0, "cm")),
+        strip.text.y = element_text(size = 12, margin = margin(.2, 0, .1, 0, "cm")),
+        plot.title = element_text(hjust = 0.5, size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) + 
+  xlab("% DHR") + ylab("Signature Expression")
+
+p1 + p3
+```
+
+__Suppl. Fig. 4(B)__ (Here it relies on the full dataset - including carriers)
+CYBB expression
+```{r, fig.height=6, fig.width=10}
+pbmc.mono.expr.aggr.corr_total %>% mutate(clust = factor(clust, levels = cell_order)) %>% 
+  filter(gene == "CYBB") %>% 
+  ggplot() + 
+  aes(x = clust, y = log(value + 1), fill = smpl_type) + 
+  geom_boxplot(alpha=.6) + 
+  scale_fill_manual(name = "Sample Type", values = c("steelblue", "springgreen4", "salmon"), 
+                    breaks = c("control", "carrier", "proband"), 
+                    labels = SMPL_TYPES) +
+  scale_color_manual(name = "Sample Type", values = c("steelblue", "springgreen4", "salmon"), 
+                     breaks = c("control", "carrier", "proband"),
+                     labels = SMPL_TYPES) +
+  xlab("") + ylab("Log(Expression)")
+```
+
+__Suppl. Fig. 4(D)__
+Aggregate of all comparisons - major shift appears to be in probands vs controls and carriers vs controls, not probands vs carriers, which appear to be indistinguishable
+```{r, fig.height=6, fig.width=4}
+all_comps %>% filter(clust == sig) %>% dplyr::select(-clust, -sig) %>% 
+  ggplot() + 
+  aes(x = smpl_type, y = s) +
+  geom_boxplot(aes(x = smpl_type, y = s, fill = smpl_type, alpha = .6), outlier.shape = NA) + 
+  geom_jitter(aes(x = smpl_type, y = s, col = smpl_type, alpha = .6)) +
+  scale_y_continuous(expand = expansion(mult = c(0.2, 0.2))) + 
+  stat_compare_means(comparisons = 
+                       list(c("Control", "Carrier"), c("Control", "Proband")), 
+                     method = "wilcox.test", 
+                     label = "p.signif", 
+                     color = "grey40", vjust = 0.7, size = 6, hide.ns = TRUE) +
+ scale_fill_manual(values = DEFAULT_COLORS, breaks = SMPL_TYPES) +
+  scale_color_manual(values = DEFAULT_COLORS, breaks = SMPL_TYPES) +
+  xlab("") + ylab("Signature Expression")
+```
+
+__10. Evaluate whether expression of cluster-specific signatures can classify carriers from controls (+ calculate null expectation/p-value)__
+
+__Carrier classification experiment__
+
+Rank carriers using the cluster-specific proband-derived signatures to see if they can rank carriers above the control samples. 
+This ranking can be converted to an AUROC using the following formula - 
+
+$${AUC=\frac {U} {{N}_{carrier}*{{N}_{control}}}}$$ (where U is derived from the Mann-Whitney test - Hanley and McNeil, 1982)
+
+```{r}
+res.pred.carrier <- data.frame()
+
+x <- lapply(X = all_used_cell_types, FUN = function(i){
+
+  r <- all_male_DE[[i]]$prob_con
+
+  filt_de <- r %>% filter(log2FoldChange > 0) %>% filter(!is.na(padj)) %>% 
+    arrange(-log2FoldChange)
+  
+  gene.sig.proband <- filt_de %>% dplyr::select(gene) %>% "[["(1) %>% head(100)
+  
+  sum_ranks <- 
+    pbmc.mono.female.expr.aggr.corr %>% filter(clust == i) %>%
+    filter(gene %in% gene.sig.proband) %>%
+    group_by(gene) %>%
+    filter(sd(value) != 0) %>%
+    mutate(z = (value - mean(value))/sd(value)) %>%
+    ungroup %>% group_by(smpl) %>%
+    mutate(sum = sum(z)) %>% ungroup %>%
+    dplyr::select(sum, smpl, smpl_type) %>%
+    distinct %>%
+    mutate(rank = rank(sum)) %>%
+    filter(smpl_type == "carrier") %>%
+    dplyr::select(rank) %>% "[["(1) %>%
+    sum
+  
+  
+  all_samples <- female.expr.aggr.corr %>% dplyr::select(smpl, smpl_type) %>% distinct
+  
+  p_samples <- all_samples %>% filter(smpl_type == "carrier") %>% nrow
+  
+  n_samples <- all_samples %>% filter(smpl_type == "control") %>% nrow
+  
+  curr.roc.test <- sum_ranks / (p_samples * n_samples) - (p_samples + 1) / (2 * n_samples)
+  
+  res.pred.carrier <<- 
+    rbind(res.pred.carrier, data.frame(n_genes = i, n_genes_actual = length(gene.sig.proband), roc = curr.roc.test, mode = "test",
+                                       clust = i))
+})
+```
+
+The AUROC is evaluating the ability of each individual gene to rank disease samples above control samples, however since we have only 10 carrier and 7 female control samples, it is important to evaluate the null distribution of AUROCs by random permutation of the ordering of samples (since only a small number of AUROC values are theoretically possible). This task also lends itself rather well to multi-core processing as each permutation can be calculated individually. 
+```{r}
+smpls.emp.dist.roc <- data.frame(smpl = unique(female.expr.aggr.corr$smpl)) %>% mutate(smpl_type = str_split(smpl, "_", simplify = TRUE)[, 1])
+p_samples <- smpls.emp.dist.roc %>% filter(smpl_type == "carrier") %>% nrow
+n_samples <- smpls.emp.dist.roc %>% filter(smpl_type == "control") %>% nrow
+
+null.dist <- 
+  lapply(seq(from = 1, to = 20000, by = 1), FUN = function(i){
+    set.seed(i)
+    curr.smpl <- smpls.emp.dist.roc %>% mutate(rank = sample(seq_along(smpl), nrow(.)))
+    sum_ranks <- 
+      curr.smpl %>%
+      filter(smpl_type == "carrier") %>%
+      dplyr::select(rank) %>% "[["(1) %>%
+      sum
+    curr.roc.test <- sum_ranks / (p_samples * n_samples) - (p_samples + 1) / (2 * n_samples)
+})
+
+data.frame(roc = unlist(null.dist)) %>% ggplot() + aes(x = roc) + geom_histogram()
+
+emp.null <- data.frame(roc = unlist(null.dist))
+
+null.auroc <- emp.null %>% top_frac(n = 0.05, wt = roc) %>% arrange(roc)
+null.auroc <- null.auroc[[1]][1]
+```
+
+__Fig. 2(C)__
+
+Plot AUROCs including the AUROC corresponding to a p-value of 0.05 based on the empirical distribution calculated above
+```{r, fig.width=4.5, fig.height=6}
+cols <- rcartocolor::carto_pal(name = "Antique", n = 12)
+set.seed(1)
+cols <- sample(cols, length(cols))
+cols <- lighten(cols, amount = 0.15)
+names(cols) <- all_used_cell_types
+
+res.pred.carrier %>% filter(mode == "test") %>% mutate(clust = factor(clust, levels = cell_order)) %>%
+  ggplot() + aes(x = clust, y = roc, fill = clust) + 
+  geom_bar(stat = 'identity') + 
+  ylim(0, 1) + 
+  scale_fill_manual(values = cols, breaks = names(cols), labels = names(cols)) + 
+  geom_hline(yintercept = 0.5, linetype = "dotted") +
+  geom_hline(yintercept = null.auroc, linetype = "dashed") + 
+  ylab("AUROC") + xlab("")
+```
+
+Calculate similar AUROCs for cross-cluster prediction - i.e. classification of carrier clusters using signatures derived from other proband clusters
+```{r}
+res.pred.carrier.across <- data.frame()
+
+all_samples <- pbmc.mono.female.expr.aggr.corr %>% dplyr::select(smpl, smpl_type) %>% distinct
+
+p_samples <- all_samples %>% filter(smpl_type == "carrier") %>% nrow
+
+n_samples <- all_samples %>% filter(smpl_type == "control") %>% nrow
+
+x <- lapply(X = all_used_cell_types, FUN = function(i){
+  
+  x <- lapply(X = names(male_DE), FUN = function(j){
+    
+    r <- all_male_DE[[i]]$prob_con
+    
+    filt_de <- r %>% filter(log2FoldChange > 0) %>% 
+      filter(!is.na(padj)) %>% arrange(-log2FoldChange)
+    
+    gene.sig.proband <- filt_de %>% dplyr::select(gene) %>% "[["(1) %>% head(100)
+    
+    sum_ranks <- 
+      pbmc.mono.female.expr.aggr.corr %>% filter(clust == j) %>%
+      filter(gene %in% gene.sig.proband) %>%
+      group_by(gene) %>%
+      filter(sd(value) != 0) %>%
+      mutate(z = (value - mean(value))/sd(value)) %>%
+      ungroup %>% group_by(smpl) %>%
+      mutate(sum = sum(z)) %>% ungroup %>%
+      dplyr::select(sum, smpl, smpl_type) %>%
+      distinct %>%
+      mutate(rank = rank(sum)) %>%
+      filter(smpl_type == "carrier") %>%
+      dplyr::select(rank) %>% "[["(1) %>%
+      sum
+    
+    curr.roc.test <- sum_ranks / (p_samples * n_samples) - (p_samples + 1) / (2 * n_samples)
+    
+    res.pred.carrier.across <<- 
+      rbind(res.pred.carrier.across, 
+            data.frame(n_genes = i, 
+                       n_genes_actual = length(gene.sig.proband), 
+                       roc = curr.roc.test, mode = "test", 
+                       sig = i, 
+                       clust = j))
+    
+  })
+})
+```
+
+prediction of male-specific DE from total DE and corresponding null distribution of AUROCs
+```{r}
+rocs <- data.frame()
+x <- lapply(names(all_DE), function(i){
+  
+  test_tbl <- 
+    all_DE[[i]]$prob_con %>% mutate(r = rank(log2FoldChange)) %>% filter(gene %in% all_up_sigs_male[[i]])
+  
+  sum_rank <- sum(test_tbl$r)
+  
+  p <- length(all_up_sigs_male[[i]])
+  
+  n <- nrow(all_DE[[i]]$prob_con) - p
+  
+  rocs <<- rbind(rocs, data.frame(clust = i, roc = sum_rank/(p * n) - (p + 1)/(2 * n)))
+})
+
+null.rocs <- list()
+x <- lapply(seq(1, 1000000, 1), function(i){
+  
+  set.seed(i)
+  null.sum_rank <- sum(round(runif(n = 100, min = 1, max = nrow(all_DE$`CD16+ Monocytes`$prob_con)), 0))
+  
+  p <- length(all_up_sigs_male$`CD16+ Monocytes`)
+  
+  n <- nrow(all_DE$`CD16+ Monocytes`$prob_con) - p
+  
+  null.rocs[[i]] <<- null.sum_rank/(p * n) - (p + 1)/(2 * n)
+})
+```
+
+__Suppl. Fig. 5(A)__
+
+AUROCs of predicting cluster-specific signatures from male-only signatures
+```{r, fig.width=4.5, fig.height=6}
+rocs %>% 
+  ggplot() + aes(x = factor(clust, levels = cell_order), y = roc, fill = clust) + 
+  geom_bar(stat = 'identity') + 
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90)) + ylim(0, 1) + 
+  scale_fill_manual(values = cols, breaks = names(cols), labels = names(cols)) + 
+  geom_hline(yintercept = 0.5, linetype = "dotted") +
+  xlab("") + ylab("AUROC") + 
+  geom_hline(yintercept = mean(unlist(null.rocs)), linetype = "dashed", color = "red") 
+```
+
+__Suppl. Fig. 5(B)__
+
+Plot heatmap of AUROCs of cross-cluster predictions
+```{r}
+tmp <- res.pred.carrier.across %>% filter(sig %in% unique(res.pred.carrier.across$clust)) %>% pivot_wider(id_cols = sig, names_from = clust, values_from = roc) %>% column_to_rownames("sig")
+
+col_fun = colorRamp2(c(0.5, max(tmp)), c("steelblue", "salmon"))
+
+Heatmap(tmp[head(cell_order, -2), head(cell_order, -2)], cluster_columns = FALSE, cluster_rows = FALSE, col = col_fun, name = "AUROC", column_title = "Cluster evaluated", row_title = "Signature derived from")
+```
+
+__11. Load in reference CoCoCoNet co-expression networks for human and other species (+ subset and re-rank networks)__
+
+```{r}
+source("src/coexp.R", local = knitr::knit_global())
+```
+
+Convert up-regulated signatures to ENSEMBL IDs
+```{r}
+up_sigs_ensembl <- list()
+a <- lapply(names(all_up_sigs), function(j){
+  up_sigs_ensembl[[j]] <<- filt_mapping$ensembl_gene_id[match(all_up_sigs[[j]], filt_mapping$hgnc_symbol)]
+})
+
+down_sigs_ensembl <- list()
+a <- lapply(names(down_sigs), function(j){
+  down_sigs_ensembl[[j]] <<- filt_mapping$ensembl_gene_id[match(down_sigs[[j]], filt_mapping$hgnc_symbol)]
+})
+
+all_up_sigs_male <- c(up_sigs_male, up_sigs_male_mono)
+up_sigs_male_ensembl <- list()
+a <- lapply(names(all_up_sigs_male), function(j){
+  up_sigs_male_ensembl[[j]] <<- filt_mapping$ensembl_gene_id[match(all_up_sigs_male[[j]], filt_mapping$hgnc_symbol)]
+})
+```
+
+__12. Evaluate co-expression of cluster-specific disease signatures in reference co-expression networks__
+
+Run EGAD (Ballouz et al, 2017, Bioinformatics) to evaluate the co-expression of gene signatures in the reference human co-expression network.
+```{r}
+set.seed(42)
+res_human_egad <- run_GBA(ref_networks$human, labels = list_to_matrix(up_sigs_male_ensembl, universal_set = rownames(ref_networks$human)), nfold = 3)
+```
+
+Evaluate co-expression of GO terms in same reference human network to establish a background context of scores for plotting
+```{r}
+ensembl_go <- list()
+x <- lapply(names(GO_complete), function(i){
+  tmp <- GO_complete[[i]]
+  tmp <- intersect(filt_mapping$hgnc_symbol, tmp)
+  tmp <- filt_mapping$ensembl_gene_id[match(tmp, filt_mapping$hgnc_symbol)]
+  tmp <- intersect(tmp, rownames(ref_networks$human))
+  ensembl_go[[i]] <<- tmp
+})
+
+set.seed(42)
+res_go_egad <- run_GBA(ref_networks$human, labels = list_to_matrix(ensembl_go, universal_set = rownames(ref_networks$human)), nfold = 3)
+
+mean_go_auc <- data.frame(res_go_egad[[1]]) %>% arrange(-auc) %>% summarise(m = mean(auc)) %>% dplyr::select(m) %>% "[["(1)
+```
+
+__Fig. 2(D)__
+
+Plot EGAD output (add line for average score of all GO terms evaluated)
+```{r, fig.width=4.5, fig.height=6}
+data.frame(res_human_egad[[1]]) %>% rownames_to_column("clust") %>% 
+  ggplot() + aes(x = factor(clust, levels = cell_order), y = auc, fill = clust) + 
+  geom_bar(stat = 'identity') + 
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90)) + ylim(0, 1) + 
+  scale_fill_manual(values = cols, breaks = names(cols), labels = names(cols)) + 
+  geom_hline(yintercept = 0.5, linetype = "dotted") +
+  xlab("") + ylab("AUROC") + 
+  geom_hline(yintercept = mean_go_auc, linetype = "dashed") +
+```
+
+__13. Evaluate conservation of co-expression using 1-1 orthologs across species in reference co-expression networks__
+
+Evaluate co-expression conservation across species using 1-1 orthologs 
+of cluster-specific proband-derived disease signatures with EGAD
+```{r}
+res_cross_species_egad <- list()
+gc()
+a <- lapply(X = chordata, FUN = function(i){
+  gc()
+  print(i)
+  sp <- all_maps %>% filter(first == i | second == i) %>% dplyr::select(all_maps) %>% unique %>% "[["(1)
+  species_sig <- list()
+  a <- lapply(names(up_sigs_male_ensembl), function(j){
+    
+    mapping <- read.csv(paste("CoCoCoNet/orthologMaps/", sp, sep = "")) %>% 
+    dplyr::select(i, human) %>% 
+    filter(human %in% up_sigs_male_ensembl[[j]])
+    mapping <- mapping %>% table
+    mapping
+    mapping <- mapping[rowSums(mapping) == 1, colSums(mapping) == 1]
+    u <- data.frame(mapping) %>% filter(Freq == 1) %>% mutate(sig = as.character(!!rlang::sym(i))) %>% dplyr::select(sig) %>% "[["(1)
+    if(length(u) >= 20){
+      species_sig[[j]] <<- u
+    }
+  })
+  if(length(species_sig) >= 1){
+    set.seed(42)
+    res_cross_species_egad[[i]] <<- 
+      run_GBA(network = ref_networks[[i]], labels = list_to_matrix(species_sig, universal_set = rownames(ref_networks[[i]])), nfold = 3)
+  }
+  gc()
+})
+```
+
+Data wrangling to get the pairwise evolutionary distances from the distance matrix
+```{r}
+tmp <- data.frame()
+a <- lapply(names(res_cross_species_egad), function(i){
+  tmp <<- rbind(tmp, data.frame(res_cross_species_egad[[i]][1]) %>% mutate(species = i))
+})
+
+tmp <- tmp %>% rownames_to_column("cell_type")
+
+tmp <- rbind(tmp, data.frame(res_human_egad[[1]]) %>% rownames_to_column("cell_type") %>% mutate(species = "human"))
+
+human_dist <- data.frame(value = 0, species = "human")
+taxo_distances <- taxo_distances %>% 
+  melt %>% 
+  dplyr::select(X, variable, value) %>% 
+  filter(!is.na(value)) %>% 
+  mutate(variable = as.character(variable)) %>% 
+  filter(X == "human" | variable == "human") %>% 
+  mutate(species = ifelse(X == "human", variable, X)) %>% 
+  dplyr::select(value, species)
+
+taxo_distances <- rbind(human_dist, taxo_distances)
+taxo_distances <- taxo_distances %>% mutate(species = replace(species, species == "salmon", "atlanticsalmon"), species = replace(species, species == "trout", "rainbowtrout"))
+```
+
+Merge evolutionary distances with co-expression scores as calculated by EGAD using 1-1 orthologs of 
+cluster-specific proband-derived disease signatures
+```{r}
+final_res <- merge(tmp, taxo_distances, by = "species")
+```
+
+__Fig. 2(E)__
+
+Plot cross-species co-expression of disease signatures and calculate correlation with evolutionary distance from humans
+```{r, fig.width=7, fig.height=5}
+library(stringi)
+merge(final_res %>% 
+        mutate(cell_type = stri_replace_all_regex(cell_type, "\\d+$", "")), species %>% dplyr::select(Common_name, saved_name) %>% 
+        dplyr::rename(species = saved_name), by = "species") %>% 
+        filter(cell_type == "CD14+ Monocytes" | cell_type == "CD16+ Monocytes") %>%
+  ggplot() + 
+  aes(x = value, y = auc) + geom_point(size = 4, aes(color = ifelse(Common_name == "Human", "salmon", "royalblue1"))) +
+  geom_smooth(method = "glm", alpha = 0.1, color = alpha("steelblue", 0.4)) + 
+  scale_color_manual(values = c("salmon", "royalblue1"), breaks = c("salmon", "royalblue1")) +
+  xlab("Evolutionary distance from humans") + ylab("AUROC") +
+  geom_text_repel(aes(label = Common_name), max.overlaps = 20) +
+  ylim(0.5, 1) + 
+  facet_wrap(~cell_type) + 
+  stat_cor(method = "pearson", label.y.npc="bottom", label.x.npc = "left")
+```
+
+__Suppl. Fig. 5(C)__
+
+Plot cross-species co-expression of disease signatures and calculate correlation with evolutionary distance from humans for other clusters
+```{r, fig.width=10, fig.height=10}
+library(stringi)
+merge(final_res %>% 
+        mutate(cell_type = factor(stri_replace_all_regex(cell_type, "\\d+$", ""), levels = cell_order)), species %>% dplyr::select(Common_name, saved_name) %>% 
+        dplyr::rename(species = saved_name), by = "species") %>% 
+        filter(cell_type != "CD14+ Monocytes" & cell_type != "CD16+ Monocytes") %>%
+  ggplot() + 
+  aes(x = value, y = auc) + geom_point(size = 4, aes(color = ifelse(Common_name == "Human", "salmon", "royalblue1"))) +
+  geom_smooth(method = "glm", alpha = 0.2, color = alpha("steelblue", 0.4)) + 
+  scale_color_manual(values = c("salmon", "royalblue1"), breaks = c("salmon", "royalblue1")) +
+  xlab("Evolutionary distance from humans") + ylab("AUROC") +
+  geom_text_repel(aes(label = Common_name), max.overlaps = 16) +
+  ylim(0.5, 1) + 
+  facet_wrap(~cell_type) + 
+  stat_cor(method = "pearson", label.y.npc="bottom", label.x.npc = "left")
+```
+
+__14. Evaluate co-expression partners of CYBB with relationship to the type 1 interferon pathway__
+
+Evaluate the co-expression partners of _CYBB_ in the top 50 shared (across at least 5 individual clusters) enriched GO terms
+```{r}
+library(igraph)
+viz_genes <- Reduce(f = union, x = GO_subset[broad_sigs[1:50]])
+
+viz_genes <- filt_mapping$ensembl_gene_id[match(viz_genes, filt_mapping$hgnc_symbol)]
+
+viz_genes <- intersect(viz_genes, rownames(ref_networks$human))
+
+sub_adj <- rank_matrix(ref_networks$human[viz_genes, viz_genes])
+
+sub_adj[sub_adj < 0.8] <- 0
+
+sub_adj[sub_adj >= 0.8] <- 1
+
+viz_net <- graph_from_adjacency_matrix(sub_adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+viz_net <- simplify(viz_net)
+
+isolated <- which(igraph::degree(viz_net) < 10)
+
+viz_net <- igraph::delete.vertices(viz_net, V(viz_net)[isolated])
+
+viz_net <- set.vertex.attribute(viz_net, "name", value = filt_mapping$hgnc_symbol[match(names(V(viz_net)), filt_mapping$ensembl_gene_id)])
+```
+
+__Fig. 2(F)__
+
+Plot manipulation + plot visualization of co-expression partners of CYBB which might play an important role in initiating and driving the
+type I interferon response in X-CGD carriers and probands
+```{r, fig.height=15, fig.width=15}
+genes_to_label <- Reduce(union, c(GO_subset$GO_RESPONSE_TO_TYPE_I_INTERFERON, GO_subset$GO_NADPH_OXIDASE_COMPLEX,
+                                  GO_subset$GO_RESPONSE_TO_INTERFERON_ALPHA, GO_subset$GO_RESPONSE_TO_INTERFERON_BETA))
+
+zoom_viz <- induced.subgraph(viz_net, which(names(V(viz_net)) %in% genes_to_label))
+
+E(zoom_viz)$color <- "lightblue"
+E(zoom_viz)[.inc("CYBB")]$color <- "dodgerblue2"
+E(zoom_viz)[.inc("CYBB")]$width <- 2
+
+E(zoom_viz)[.inc("IRF5")]$color <- "dodgerblue"
+
+V(zoom_viz)$color <- "steelblue"
+V(zoom_viz)$size <- 0.2
+
+V(zoom_viz)[names(V(zoom_viz)) %in% Reduce(union, c(GO_subset$GO_RESPONSE_TO_TYPE_I_INTERFERON,
+                                                GO_subset$GO_RESPONSE_TO_INTERFERON_ALPHA, GO_subset$GO_RESPONSE_TO_INTERFERON_BETA))]$color <- "blue2"
+V(zoom_viz)[names(V(zoom_viz)) %in% Reduce(union, c(GO_subset$GO_RESPONSE_TO_TYPE_I_INTERFERON,
+                                                GO_subset$GO_RESPONSE_TO_INTERFERON_ALPHA, GO_subset$GO_RESPONSE_TO_INTERFERON_BETA))]$size <- 1.5
+
+V(zoom_viz)[names(V(zoom_viz)) %in% GO_subset$GO_NADPH_OXIDASE_COMPLEX]$color <- "red1"
+V(zoom_viz)[names(V(zoom_viz)) %in% GO_subset$GO_NADPH_OXIDASE_COMPLEX]$size <- 1.5
+
+t_viz <- graph_from_edgelist(ends(zoom_viz, E(zoom_viz)[.inc("CYBB")]))
+
+V(zoom_viz)$label.cex <- 0.9
+V(zoom_viz)[which(names(V(zoom_viz)) %in% names(V(t_viz)))]$size <- 2.5
+V(zoom_viz)[which(names(V(zoom_viz)) %in% names(V(t_viz)))]$label.cex <- 1.2
+V(zoom_viz)[names(V(zoom_viz)) %in% Reduce(union, all_up_sigs_male)]$label.cex <- 1.2
+V(zoom_viz)[which(names(V(zoom_viz)) == "CYBB")]$label.cex <- 1.6
+
+V(zoom_viz)[names(V(zoom_viz)) %in% "CYBB"]$size <- 4
+V(zoom_viz)[names(V(zoom_viz)) %in% "CYBB"]$color <- "green1"
+
+V(zoom_viz)[names(V(zoom_viz)) %in% Reduce(union, all_up_sigs)]$color <- "yellow2"
+V(zoom_viz)[names(V(zoom_viz)) %in% Reduce(union, all_up_sigs)]$size <- 2.5
+
+set.seed(-42)
+l <- layout_with_drl(zoom_viz)
+
+new_graph = graph_from_data_frame(d = igraph::as_data_frame(zoom_viz, what="edges") %>%
+    arrange(desc(color)),
+    vertices=igraph::as_data_frame(zoom_viz,what="vertices"), directed = FALSE)
+
+new_graph$layout <- zoom_viz$layout
+
+set.seed(-42)
+plot.igraph(new_graph, edge.curved = 0.2, vertex.label.family = "Arial", vertex.label.dist=-0.6, layout = l)
+```
