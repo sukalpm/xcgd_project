@@ -65,7 +65,7 @@ library(utility.functions)
         
 Set global variables/options and links to external files
 ```{r}
-source("src/globals.R", local = knitr::knit_global())
+source("R/globals.R", local = knitr::knit_global())
 ```
 
 ```{r}
@@ -586,7 +586,7 @@ Integration section - very resource (esp. memory) intensive - for ~400,000 cells
 Integration of PBMC datasets - adapted from Seurat RPCA integration vignette
 
 ```{r}
-source("src/integration.R", local = knitr::knit_global())
+source("R/integration.R", local = knitr::knit_global())
 ```
 
 ***
@@ -933,7 +933,7 @@ pbmc.combined.no.carriers <- subset(pbmc.combined, smpl_type != "carrier")
 ```
 
 ```{r}
-source("src/diff_exp.R", local = knitr::knit_global())
+source("R/diff_exp.R", local = knitr::knit_global())
 ```
 
 __Fig. 1(F)__
@@ -1783,7 +1783,7 @@ Heatmap(tmp[head(cell_order, -2), head(cell_order, -2)], cluster_columns = FALSE
 __11. Load in reference CoCoCoNet co-expression networks for human and other species (+ subset and re-rank networks)__
 
 ```{r}
-source("src/coexp.R", local = knitr::knit_global())
+source("R/coexp.R", local = knitr::knit_global())
 ```
 
 Convert up-regulated signatures to ENSEMBL IDs
