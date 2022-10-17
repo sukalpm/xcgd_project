@@ -1,10 +1,10 @@
 # Data analysis of single-cell sequencing of X-linked chronic granulomatous disease
 Codebase for X-CGD single-cell expression data analysis
 
-__analysis_notebook.Rmd__ contains all code necessary to run the analyses as described in
+__Rmd/analysis_notebook.Rmd__ contains all code necessary to run the analyses as described in
 __"Autoimmunity-related disease signatures shared across cell type dominate the transcriptional landscape of X-linked CGD"__
 
-Code for running components of the analysis are in src/ and are referenced at the appropriate location in __analysis_notebook.Rmd__ - 
+Code for running components of the analysis are in R/ and are referenced at the appropriate location in __Rmd/analysis_notebook.Rmd__ - 
 Global variables and supporting function - globals.R
 Integration pipeline - integration.R
 Differential expression - diff_exp.R
