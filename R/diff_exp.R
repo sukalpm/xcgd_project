@@ -4,6 +4,8 @@
 #strategy used is to exclude all genes which have an absolute fold
 #change of more than mean fold change +/- 40 x s.d. of the fold change.
 
+library(parallel)
+
 cluster_DE_results <- list()
 
 x <- mclapply(X = used_cell_types, FUN = function(i){
